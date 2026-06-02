@@ -436,3 +436,37 @@ logger.info(
   },
   "superlog proxy listening",
 );
+
+// Drain gracefully on the SIGTERM an ECS rolling deploy sends before SIGKILL:
+// stop accepting new HTTP requests, then let the queue consumer finish (and
+// delete) its in-flight messages. Without this the task is killed mid-batch and
+// the received-but-undeleted SQS messages stay invisible for the full visibility
+// timeout before redelivering — the sawtooth that pins ApproximateAgeOfOldestMessage
+// and trips the ingest-lag page on every deploy. ECS's stopTimeout bounds how long
+// we get; the consumer aborts its idle long-poll so the drain is fast in practice.
+let shuttingDown = false;
+async function shutdown(signal: NodeJS.Signals): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, "received shutdown signal; draining");
+  try {
+    await new Promise<void>((resolve) => {
+      if ("close" in server && typeof server.close === "function") {
+        server.close(() => resolve());
+      } else {
+        resolve();
+      }
+    });
+    if (ingestQueue && ingestQueueConfig?.consumerEnabled) {
+      await ingestQueue.stop();
+    }
+  } catch (err) {
+    // Exit non-zero so a failed drain is visible rather than masquerading as a
+    // clean stop.
+    logger.error({ err }, "error during graceful shutdown");
+    process.exit(1);
+  }
+  process.exit(0);
+}
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
