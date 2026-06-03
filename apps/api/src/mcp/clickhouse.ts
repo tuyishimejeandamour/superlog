@@ -570,6 +570,18 @@ export async function listServices(ch: ClickHouseClient, projectId: string, rang
   return rows.map((r) => r.service);
 }
 
+// Discovering which attribute keys exist only needs a representative sample of
+// rows, not every row in the window. High-volume projects produce millions of
+// spans/logs per hour, and reading the full ResourceAttributes/SpanAttributes
+// map columns across all of them took 15-30s — past the 10s ClickHouse
+// request_timeout — so the explore filter dropdown 500'd. Capping the rows each
+// scan reads before the arrayJoin/group keeps the query ~1s while still
+// surfacing effectively every key: ClickHouse reads parts in parallel, so the
+// cap samples across the window rather than just the head. Counts become
+// approximate, which is fine for ordering the dropdown. Low-volume projects read
+// fewer rows than the cap and stay exact.
+const ATTRIBUTE_KEY_SCAN_ROW_CAP = 1_000_000;
+
 export async function listAttributeKeys(
   ch: ClickHouseClient,
   projectId: string,
@@ -579,66 +591,38 @@ export async function listAttributeKeys(
   const { sinceSql, untilSql, sinceExpr, untilExpr } = resolveRange(range);
   const resourceFromLogs = source === undefined || source === "logs" || source === "metrics";
   const resourceFromTraces = source === undefined || source === "traces" || source === "metrics";
+  // Reads at most ATTRIBUTE_KEY_SCAN_ROW_CAP rows from `table`, then expands the
+  // chosen map column's keys. `prefix` namespaces keys by scope (resource./span./log.);
+  // pass "" to emit the bare key (the unscoped `source === undefined` case).
+  const keyScan = (table: string, column: string, prefix: string): string => {
+    const keyExpr = prefix ? `concat('${prefix}', k)` : "k";
+    return `
+      SELECT ${keyExpr} AS k, count() AS c FROM (
+        SELECT mapKeys(${column}) AS mk
+        FROM ${table}
+        WHERE ResourceAttributes['superlog.project_id'] = {projectId:String}
+          AND Timestamp >= ${sinceExpr}
+          AND Timestamp <= ${untilExpr}
+        LIMIT ${ATTRIBUTE_KEY_SCAN_ROW_CAP}
+      ) ARRAY JOIN mk AS k
+      GROUP BY k`;
+  };
   const subqueries: string[] = [];
   if (source === undefined) {
-    subqueries.push(`
-      SELECT arrayJoin(mapKeys(ResourceAttributes)) AS k, count() AS c
-      FROM otel_logs
-      WHERE ResourceAttributes['superlog.project_id'] = {projectId:String}
-        AND Timestamp >= ${sinceExpr}
-        AND Timestamp <= ${untilExpr}
-      GROUP BY k`);
-    subqueries.push(`
-      SELECT arrayJoin(mapKeys(ResourceAttributes)) AS k, count() AS c
-      FROM otel_traces
-      WHERE ResourceAttributes['superlog.project_id'] = {projectId:String}
-        AND Timestamp >= ${sinceExpr}
-        AND Timestamp <= ${untilExpr}
-      GROUP BY k`);
+    subqueries.push(keyScan("otel_logs", "ResourceAttributes", ""));
+    subqueries.push(keyScan("otel_traces", "ResourceAttributes", ""));
   } else {
     if (resourceFromLogs) {
-      subqueries.push(`
-      SELECT concat('resource.', k) AS k, c FROM (
-        SELECT arrayJoin(mapKeys(ResourceAttributes)) AS k, count() AS c
-        FROM otel_logs
-        WHERE ResourceAttributes['superlog.project_id'] = {projectId:String}
-          AND Timestamp >= ${sinceExpr}
-          AND Timestamp <= ${untilExpr}
-        GROUP BY k
-      )`);
+      subqueries.push(keyScan("otel_logs", "ResourceAttributes", "resource."));
     }
     if (source === "logs") {
-      subqueries.push(`
-      SELECT concat('log.', k) AS k, c FROM (
-        SELECT arrayJoin(mapKeys(LogAttributes)) AS k, count() AS c
-        FROM otel_logs
-        WHERE ResourceAttributes['superlog.project_id'] = {projectId:String}
-          AND Timestamp >= ${sinceExpr}
-          AND Timestamp <= ${untilExpr}
-        GROUP BY k
-      )`);
+      subqueries.push(keyScan("otel_logs", "LogAttributes", "log."));
     }
     if (resourceFromTraces) {
-      subqueries.push(`
-      SELECT concat('resource.', k) AS k, c FROM (
-        SELECT arrayJoin(mapKeys(ResourceAttributes)) AS k, count() AS c
-        FROM otel_traces
-        WHERE ResourceAttributes['superlog.project_id'] = {projectId:String}
-          AND Timestamp >= ${sinceExpr}
-          AND Timestamp <= ${untilExpr}
-        GROUP BY k
-      )`);
+      subqueries.push(keyScan("otel_traces", "ResourceAttributes", "resource."));
     }
     if (source === "traces") {
-      subqueries.push(`
-      SELECT concat('span.', k) AS k, c FROM (
-        SELECT arrayJoin(mapKeys(SpanAttributes)) AS k, count() AS c
-        FROM otel_traces
-        WHERE ResourceAttributes['superlog.project_id'] = {projectId:String}
-          AND Timestamp >= ${sinceExpr}
-          AND Timestamp <= ${untilExpr}
-        GROUP BY k
-      )`);
+      subqueries.push(keyScan("otel_traces", "SpanAttributes", "span."));
     }
   }
   const query = `

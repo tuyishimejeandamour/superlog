@@ -120,6 +120,23 @@ test("listAttributeKeys includes prefixed span attributes for trace exploration"
   assert.match(capture.query ?? "", /concat\('span\.', k\)/);
 });
 
+test("listAttributeKeys caps the rows scanned per source so high-volume projects don't time out", async () => {
+  const capture: { query?: string; params?: Record<string, unknown> } = {};
+
+  await listAttributeKeys(
+    fakeClickhouse(capture),
+    "project-1",
+    { since: "now() - INTERVAL 1 HOUR", until: "now()" },
+    "traces",
+  );
+
+  // Each per-source key scan reads at most ATTRIBUTE_KEY_SCAN_ROW_CAP rows
+  // before arrayJoin/group, so the query stays ~1s instead of 15-30s.
+  const limitMatches = (capture.query ?? "").match(/LIMIT 1000000/g) ?? [];
+  // resource.* from traces + span.* from traces = two capped scans.
+  assert.equal(limitMatches.length, 2);
+});
+
 test("listAttributeValues resolves prefixed span attributes", async () => {
   const capture: { query?: string; params?: Record<string, unknown> } = {};
 
