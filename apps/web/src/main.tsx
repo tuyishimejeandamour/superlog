@@ -27,7 +27,7 @@ function Analytics({ children }: { children: ReactNode }) {
       apiKey={posthogToken}
       options={{
         api_host: import.meta.env.VITE_PUBLIC_POSTHOG_HOST || "https://eu.i.posthog.com",
-        ui_host: "https://eu.posthog.com",
+        ui_host: import.meta.env.VITE_PUBLIC_POSTHOG_UI_HOST || "https://eu.posthog.com",
         defaults: "2026-01-30",
         capture_exceptions: true,
         debug: import.meta.env.DEV,

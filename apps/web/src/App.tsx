@@ -63,7 +63,10 @@ function PostHogUserSync() {
   const posthog = usePostHog();
 
   useEffect(() => {
-    if (isPending) return;
+    // `usePostHog()` returns the default (uninitialized) global instance when no
+    // PostHogProvider is mounted (token unset), so this is a safety net rather
+    // than a live crash path — guard anyway in case the return becomes nullable.
+    if (!posthog || isPending) return;
     if (data?.user) {
       posthog.identify(data.user.id, {
         email: data.user.email,
