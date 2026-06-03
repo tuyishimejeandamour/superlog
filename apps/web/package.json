@@ -32,6 +32,7 @@
     "autumn-js": "^1.2.27",
     "better-auth": "^1.6.11",
     "echarts": "^6",
+    "posthog-js": "^1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-grid-layout": "^2.2.3",

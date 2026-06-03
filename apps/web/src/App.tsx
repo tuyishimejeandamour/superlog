@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useCustomer } from "autumn-js/react";
+import { usePostHog } from "posthog-js/react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AcceptInvitation } from "./AcceptInvitation.tsx";
@@ -57,6 +58,25 @@ function GithubInstallCallbackForwarder() {
   return null;
 }
 
+function PostHogUserSync() {
+  const { data, isPending } = useSession();
+  const posthog = usePostHog();
+
+  useEffect(() => {
+    if (isPending) return;
+    if (data?.user) {
+      posthog.identify(data.user.id, {
+        email: data.user.email,
+        name: data.user.name,
+      });
+    } else {
+      posthog.reset();
+    }
+  }, [isPending, data?.user, posthog]);
+
+  return null;
+}
+
 function ActiveOrgSync() {
   const { data, isPending } = useSession();
   const queryClient = useQueryClient();
@@ -83,6 +103,7 @@ export function App() {
     <>
       <SignupSourceCapture />
       <GithubInstallCallbackForwarder />
+      <PostHogUserSync />
       <ActiveOrgSync />
       <Routes>
         <Route path="/activate" element={<Activate />} />
