@@ -3,13 +3,14 @@ import type { EChartsOption, SetOptionOpts } from "echarts";
 import type { BarSeriesOption, LineSeriesOption } from "echarts/charts";
 import type * as EChartsCore from "echarts/core";
 import { forwardRef, memo, useEffect, useMemo, useRef, useState } from "react";
-import type { SeriesRow } from "../../api.ts";
 import type { ChartType, LegendPosition } from "../types.ts";
 import { echarts } from "./echarts-setup.ts";
-import { type ChartSeries, buildTopNSeries } from "./series-topn.ts";
+import { type ChartSeries, type GroupedRow, buildTopNSeries } from "./series-topn.ts";
 
-type CountChartProps = {
-  rows: SeriesRow[];
+type SeriesChartProps<T extends GroupedRow> = {
+  rows: T[];
+  /** Per-row value accessor — `r.count` for count series, `r.value` for metrics. */
+  value: (row: T) => number;
   chartType: ChartType;
   limit: number;
   showXAxis?: boolean;
@@ -58,24 +59,25 @@ const timestampFormat = new Intl.DateTimeFormat(undefined, {
   hour12: false,
 });
 
-export function CountChart({
+export function CountChart<T extends GroupedRow>({
   rows,
+  value,
   chartType,
   limit,
   showXAxis = true,
   showYAxis = false,
   showLegend,
   legendPosition,
-}: CountChartProps) {
+}: SeriesChartProps<T>) {
   const allSeries = useMemo(
     () =>
-      buildTopNSeries(rows, (r) => r.count, limit).map((series, index) => ({
+      buildTopNSeries(rows, value, limit).map((series, index) => ({
         ...series,
         color: series.isOther
           ? OTHER_COLOR
           : (CHART_COLORS[index % CHART_COLORS.length] ?? FIRST_CHART_COLOR),
       })),
-    [rows, limit],
+    [rows, value, limit],
   );
   const [hiddenSeries, setHiddenSeries] = useState<Set<string>>(() => new Set());
 

@@ -97,7 +97,6 @@ export function AddWidget({
 
   const type = widgetTypeFor(kind, source);
   const isMetric = kind === "chart" && source === "metric";
-  const isCountChart = type === "timeseries_count";
   const isTable = kind === "table";
   const isNote = kind === "note";
   const supportsGroupBy = kind === "chart";
@@ -126,7 +125,7 @@ export function AddWidget({
         filter: { resourceAttrs: attrs.length ? attrs : undefined },
         groupBy: supportsGroupBy && groupBy ? groupBy : undefined,
         metricName: isMetric ? metricName : undefined,
-        limit: isTable ? limit : isCountChart && groupBy ? seriesLimit : undefined,
+        limit: isTable ? limit : supportsGroupBy && groupBy ? seriesLimit : undefined,
         chartType: kind === "chart" ? chartType : undefined,
         markdown: isNote ? markdown : undefined,
       },
@@ -147,7 +146,6 @@ export function AddWidget({
       seriesLimit,
       supportsGroupBy,
       isMetric,
-      isCountChart,
       isTable,
       isNote,
       kind,
@@ -282,7 +280,7 @@ export function AddWidget({
               </div>
             )}
 
-            {isCountChart && groupBy && (
+            {supportsGroupBy && groupBy && (
               <div>
                 <FieldLabel>top series</FieldLabel>
                 <Input

@@ -566,8 +566,8 @@ function WidgetSettingsButton({
   };
 
   const chartType = widget.config.chartType ?? defaultChartType(widget.type);
-  const showXAxis = widget.config.showXAxis ?? widget.type === "timeseries_count";
-  const showYAxis = widget.config.showYAxis ?? widget.type === "timeseries_count";
+  const showXAxis = widget.config.showXAxis ?? isChart;
+  const showYAxis = widget.config.showYAxis ?? isChart;
   const showLegend = widget.config.showLegend ?? false;
   const legendPosition = widget.config.legendPosition ?? "side";
   const aggregation = widget.config.aggregation ?? "auto";
@@ -641,7 +641,7 @@ function WidgetSettingsButton({
             checked={showLegend}
             onChange={(v) => setConfig({ showLegend: v })}
           />
-          {showLegend && widget.type === "timeseries_count" && (
+          {showLegend && isChart && (
             <div>
               <div className="mb-1 uppercase tracking-[0.2em] text-subtle">legend position</div>
               <div className="flex gap-1">

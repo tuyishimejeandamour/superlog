@@ -164,6 +164,19 @@ test("rollup name stays unique even when 'Other' and 'Other (rest)' are real gro
   assert.equal(new Set(series.map((s) => s.name)).size, series.length);
 });
 
+test("works with an arbitrary value accessor (metric series use r.value)", () => {
+  const rows = [
+    { bucket: "2026-06-01 00:00:00", group: "p99", value: 12.5 },
+    { bucket: "2026-06-01 00:00:00", group: "p50", value: 3.2 },
+  ];
+  const series = buildTopNSeries(rows, (r) => r.value, 10);
+  assert.deepEqual(
+    series.map((s) => s.name),
+    ["p99", "p50"],
+  );
+  assert.equal(series[0]?.total, 12.5);
+});
+
 test("default top-N is 10", () => {
   const rows = rowsFor(
     Array.from({ length: 14 }, (_, i) => ({ group: `g${i}`, count: 14 - i })),

@@ -1,9 +1,12 @@
-import { type ExploreRange, useExploreSeries } from "../../api.ts";
+import { type ExploreRange, type SeriesRow, useExploreSeries } from "../../api.ts";
 import type { Widget } from "../types.ts";
 import { defaultChartType, widgetFilterToExplore } from "../types.ts";
 import { CountChart } from "./CountChart.tsx";
 import { DEFAULT_TOP_N } from "./series-topn.ts";
 import { WidgetEmpty, WidgetLoading } from "./shared.tsx";
+
+// Stable ref so CountChart's series memo doesn't recompute every render.
+const countValue = (r: SeriesRow) => r.count;
 
 export function TimeseriesCountWidget({
   projectId,
@@ -24,6 +27,7 @@ export function TimeseriesCountWidget({
     <div className="h-full min-h-[120px]">
       <CountChart
         rows={q.data.rows}
+        value={countValue}
         chartType={widget.config.chartType ?? defaultChartType(widget.type)}
         limit={widget.config.limit ?? DEFAULT_TOP_N}
         showXAxis={widget.config.showXAxis ?? true}

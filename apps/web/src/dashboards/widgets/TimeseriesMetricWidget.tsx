@@ -1,8 +1,12 @@
-import { MetricLineChart } from "../../Explore.tsx";
-import { type ExploreRange, useExploreMetricSeries } from "../../api.ts";
+import { type ExploreRange, type MetricSeriesRow, useExploreMetricSeries } from "../../api.ts";
 import type { Widget } from "../types.ts";
 import { defaultChartType, widgetFilterToExplore } from "../types.ts";
+import { CountChart } from "./CountChart.tsx";
+import { DEFAULT_TOP_N } from "./series-topn.ts";
 import { WidgetEmpty, WidgetLoading } from "./shared.tsx";
+
+// Stable ref so CountChart's series memo doesn't recompute every render.
+const metricValue = (r: MetricSeriesRow) => r.value;
 
 export function TimeseriesMetricWidget({
   projectId,
@@ -33,13 +37,15 @@ export function TimeseriesMetricWidget({
   if (!q.data || q.data.rows.length === 0) return <WidgetEmpty />;
   return (
     <div className="h-full min-h-[120px]">
-      <MetricLineChart
+      <CountChart
         rows={q.data.rows}
+        value={metricValue}
         chartType={widget.config.chartType ?? defaultChartType(widget.type)}
-        showXAxis={widget.config.showXAxis ?? false}
-        showYAxis={widget.config.showYAxis ?? false}
+        limit={widget.config.limit ?? DEFAULT_TOP_N}
+        showXAxis={widget.config.showXAxis ?? true}
+        showYAxis={widget.config.showYAxis ?? true}
         showLegend={widget.config.showLegend ?? false}
-        height="100%"
+        legendPosition={widget.config.legendPosition ?? "side"}
       />
     </div>
   );
