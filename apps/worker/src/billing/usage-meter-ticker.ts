@@ -102,6 +102,26 @@ function createCursorStore(database: DB, windowMs: number) {
 
 const TRACK_TIMEOUT_MS = 10_000;
 
+// Attempt to create an Autumn customer for the given org so that a subsequent
+// track() call can succeed. Autumn auto-enables the Free plan on customer
+// creation (autoEnable:true in autumn.config.ts), so this is sufficient to
+// unblock metering. Throws if the creation request itself fails.
+async function createAutumnCustomer(
+  secretKey: string,
+  orgId: string,
+  fetchImpl: typeof fetch,
+): Promise<void> {
+  const res = await fetchImpl("https://api.useautumn.com/v1/customers", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ id: orgId }),
+    signal: AbortSignal.timeout(TRACK_TIMEOUT_MS),
+  });
+  // 200 = created; 409 = already exists (race with another tick or auth plugin).
+  // Both are safe to treat as success — the customer exists either way.
+  if (!res.ok && res.status !== 409) throw new Error(`autumn /customers -> ${res.status}`);
+}
+
 function createAutumnTrack(secretKey: string, fetchImpl: typeof fetch = fetch) {
   return async (orgId: string, featureId: string, value: number): Promise<void> => {
     // Bound the request so a hung Autumn connection can't stall the worker tick
@@ -113,6 +133,21 @@ function createAutumnTrack(secretKey: string, fetchImpl: typeof fetch = fetch) {
       body: JSON.stringify({ customer_id: orgId, feature_id: featureId, value }),
       signal: AbortSignal.timeout(TRACK_TIMEOUT_MS),
     });
+    if (res.status === 404) {
+      // The org is not yet provisioned in Autumn (e.g. a legacy org created
+      // before the Autumn integration, or a sign-up that bypassed the auth
+      // plugin). Auto-create the customer — Autumn attaches the Free plan via
+      // autoEnable — then retry the track so usage is not dropped.
+      await createAutumnCustomer(secretKey, orgId, fetchImpl);
+      const retry = await fetchImpl("https://api.useautumn.com/v1/track", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ customer_id: orgId, feature_id: featureId, value }),
+        signal: AbortSignal.timeout(TRACK_TIMEOUT_MS),
+      });
+      if (!retry.ok) throw new Error(`autumn /track -> ${retry.status} (after customer create)`);
+      return;
+    }
     if (!res.ok) throw new Error(`autumn /track -> ${res.status}`);
   };
 }
