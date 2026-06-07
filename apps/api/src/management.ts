@@ -239,7 +239,10 @@ export function mountManagementApi(app: Hono<any>, opts: { ch: ClickHouseClient 
       });
       if (existing) throw new HTTPException(409, { message: "slug already in use in this org" });
 
-      const [project] = await db.insert(schema.projects).values({ orgId, name, slug }).returning();
+      const [project] = await db
+        .insert(schema.projects)
+        .values({ orgId, name, slug, projectContext: body.project_context ?? "" })
+        .returning();
       if (!project) throw new HTTPException(500, { message: "failed to create project" });
 
       // Seed automation settings row so the worker doesn't need to special-case
@@ -277,6 +280,7 @@ export function mountManagementApi(app: Hono<any>, opts: { ch: ClickHouseClient 
         id: project.id,
         name: project.name,
         slug: project.slug,
+        project_context: project.projectContext,
         automerge_fix_prs: automerge.automerge_fix_prs,
         automerge_method: automerge.automerge_method,
         pr_base_branch: automerge.pr_base_branch,
@@ -334,6 +338,7 @@ export function mountManagementApi(app: Hono<any>, opts: { ch: ClickHouseClient 
             id: p.id,
             name: p.name,
             slug: p.slug,
+            project_context: p.projectContext,
             created_at: p.createdAt.toISOString(),
             automerge_fix_prs: auto?.autoMergeFixPrs ?? "never",
             automerge_method: auto?.autoMergeMethod ?? "squash",
@@ -369,6 +374,7 @@ export function mountManagementApi(app: Hono<any>, opts: { ch: ClickHouseClient 
           id: project.id,
           name: project.name,
           slug: project.slug,
+          project_context: project.projectContext,
           created_at: project.createdAt.toISOString(),
           automerge_fix_prs: automerge.automerge_fix_prs,
           automerge_method: automerge.automerge_method,
@@ -405,6 +411,7 @@ export function mountManagementApi(app: Hono<any>, opts: { ch: ClickHouseClient 
 
       const projectPatch: Partial<typeof schema.projects.$inferInsert> = {};
       if (body.name !== undefined) projectPatch.name = body.name.trim();
+      if (body.project_context !== undefined) projectPatch.projectContext = body.project_context;
       if (body.slug !== undefined) {
         const slug = body.slug.trim().toLowerCase();
         if (slug !== project.slug) {
@@ -473,6 +480,7 @@ export function mountManagementApi(app: Hono<any>, opts: { ch: ClickHouseClient 
           updated_fields: {
             name: projectPatch.name !== undefined,
             slug: projectPatch.slug !== undefined,
+            project_context: projectPatch.projectContext !== undefined,
             automerge_fix_prs: body.automerge_fix_prs !== undefined,
             automerge_method: body.automerge_method !== undefined,
             pr_base_branch: prBaseBranch !== undefined,
@@ -486,6 +494,7 @@ export function mountManagementApi(app: Hono<any>, opts: { ch: ClickHouseClient 
           id: updatedProject.id,
           name: updatedProject.name,
           slug: updatedProject.slug,
+          project_context: updatedProject.projectContext,
           created_at: updatedProject.createdAt.toISOString(),
           automerge_fix_prs: automerge.automerge_fix_prs,
           automerge_method: automerge.automerge_method,

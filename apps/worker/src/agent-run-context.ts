@@ -6,6 +6,7 @@ import {
   schema,
 } from "@superlog/db";
 import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { buildAgentRunInstructions } from "./agent-run-instructions.js";
 import { listInstallationRepositories } from "./infra/github/repositories.js";
 import { logger } from "./logger.js";
 
@@ -117,11 +118,11 @@ export async function loadAgentRunContext(
   const orgAgentRow = await db.query.orgAgentSettings.findFirst({
     where: eq(schema.orgAgentSettings.orgId, project.orgId),
   });
-  const orgInstructions = (orgAgentRow?.customInstructions ?? "").trim();
-  const projectInstructions = automation.customInstructions.trim();
-  const customInstructions = [orgInstructions, projectInstructions]
-    .filter((s) => s.length > 0)
-    .join("\n\n");
+  const customInstructions = buildAgentRunInstructions({
+    orgInstructions: orgAgentRow?.customInstructions ?? "",
+    projectContext: project.projectContext,
+    projectInstructions: automation.customInstructions,
+  });
   return {
     agentRun,
     incident,

@@ -86,6 +86,7 @@ type OrgSectionId =
   | "mgmt-keys"
   | "github-install";
 type ProjectSectionId =
+  | "general"
   | "integrations"
   | "agent"
   | "issue-filter"
@@ -105,6 +106,7 @@ const ORG_SECTIONS: ReadonlyArray<{ id: OrgSectionId; label: string }> = [
 ];
 
 const PROJECT_SECTIONS: ReadonlyArray<{ id: ProjectSectionId; label: string }> = [
+  { id: "general", label: "General" },
   { id: "integrations", label: "Integrations" },
   { id: "agent", label: "Agent" },
   { id: "issue-filter", label: "Issue filter" },
@@ -286,7 +288,7 @@ function SettingsSidebar({
               onCancel={() => setCreating(false)}
               onCreated={(p) => {
                 setCreating(false);
-                onNavigate({ scope: "project", projectId: p.id, section: "integrations" });
+                onNavigate({ scope: "project", projectId: p.id, section: "general" });
               }}
             />
           </li>
@@ -705,6 +707,15 @@ function ProjectSectionView({
   projectId: string | undefined;
 }) {
   switch (section) {
+    case "general":
+      return (
+        <Section
+          title="General"
+          subtitle="Project name, slug, and context available to investigations."
+        >
+          <ProjectGeneralCard projectId={projectId} />
+        </Section>
+      );
     case "integrations":
       return (
         <Section title="Integrations" subtitle="Per-project connections.">
@@ -761,6 +772,104 @@ function ProjectSectionView({
         </Section>
       );
   }
+}
+
+const PROJECT_CONTEXT_MAX_LEN = 8000;
+
+function ProjectGeneralCard({ projectId }: { projectId: string | undefined }) {
+  const projectsQ = useOrgProjects();
+  const update = useUpdateOrgProject();
+  const project = projectsQ.data?.projects.find((p) => p.id === projectId) ?? null;
+  const value = project?.projectContext ?? "";
+  const [draft, setDraft] = useState(value);
+  const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [savedTick, setSavedTick] = useState(false);
+
+  useEffect(() => {
+    if (!project) return;
+    if (loadedProjectId === project.id) return;
+    setDraft(project.projectContext);
+    setLoadedProjectId(project.id);
+    setError(null);
+  }, [loadedProjectId, project]);
+
+  const loaded = !!project && loadedProjectId === project.id;
+  const dirty = loaded && draft !== value;
+  const disabled = !loaded || projectsQ.isLoading || update.isPending;
+
+  return (
+    <Tile>
+      <div className="space-y-4">
+        <div className="grid gap-4 md:grid-cols-2">
+          <div>
+            <span className="mb-1.5 block text-[12px] text-muted">Project name</span>
+            <Input value={project?.name ?? ""} disabled />
+          </div>
+          <div>
+            <span className="mb-1.5 block text-[12px] text-muted">Slug</span>
+            <Input value={project?.slug ?? ""} disabled />
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <FieldLabel>Project context</FieldLabel>
+          <textarea
+            value={draft}
+            disabled={disabled}
+            onChange={(e) => setDraft(e.target.value.slice(0, PROJECT_CONTEXT_MAX_LEN))}
+            rows={7}
+            placeholder="e.g. This project is the billing API. Stripe customer IDs are org-scoped. Prefer touching packages/billing before app code."
+            className="w-full rounded-sm border border-border bg-surface-2 p-3 font-mono text-[12.5px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
+          />
+          <div className="flex items-center justify-between text-[12px] text-muted">
+            <span>Included as project context for investigations in this project.</span>
+            <span className="font-mono tabular-nums">
+              {draft.length} / {PROJECT_CONTEXT_MAX_LEN}
+            </span>
+          </div>
+        </div>
+
+        {error && <p className="text-[12px] text-danger">{error}</p>}
+
+        <div className="flex items-center gap-2">
+          <Btn
+            size="sm"
+            variant="primary"
+            disabled={!dirty || disabled}
+            loading={update.isPending}
+            onClick={() => {
+              if (!project || !loaded) return;
+              setError(null);
+              update.mutate(
+                { projectId: project.id, patch: { projectContext: draft } },
+                {
+                  onSuccess: () => {
+                    setSavedTick(true);
+                    setTimeout(() => setSavedTick(false), 1500);
+                  },
+                  onError: (err) => setError(err instanceof Error ? err.message : String(err)),
+                },
+              );
+            }}
+          >
+            Save context
+          </Btn>
+          {dirty && (
+            <Btn
+              size="sm"
+              variant="ghost"
+              disabled={update.isPending}
+              onClick={() => setDraft(value)}
+            >
+              Discard
+            </Btn>
+          )}
+          {savedTick && <span className="text-[12px] text-success">Saved</span>}
+        </div>
+      </div>
+    </Tile>
+  );
 }
 
 function Section({

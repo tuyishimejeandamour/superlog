@@ -354,6 +354,7 @@ export const projects = pgTable(
       .references(() => orgs.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     slug: text("slug").notNull(),
+    projectContext: text("project_context").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => ({

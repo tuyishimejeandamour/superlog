@@ -30,6 +30,7 @@ const slugSchema = z
   .regex(SLUG_RE, "slug must be lowercase alphanumeric + dashes, max 40 chars");
 
 const nameSchema = z.string().min(1).max(120);
+const projectContextSchema = z.string().max(8000);
 
 export const projectIdParamSchema = z.object({
   projectId: z.string().uuid(),
@@ -47,6 +48,7 @@ export const repoIdParamSchema = z.object({
 export const createProjectInputSchema = z.object({
   name: nameSchema,
   slug: slugSchema,
+  project_context: projectContextSchema.optional(),
   mint_ingest_key: z
     .boolean()
     .default(true)
@@ -60,6 +62,7 @@ export const updateProjectInputSchema = z
   .object({
     name: nameSchema.optional(),
     slug: slugSchema.optional(),
+    project_context: projectContextSchema.optional(),
     automerge_fix_prs: automergePolicySchema.optional(),
     automerge_method: automergeMethodSchema.optional(),
     pr_base_branch: prBaseBranchSchema.optional(),
@@ -143,6 +146,7 @@ export const projectSchema = z
     id: z.string().uuid(),
     name: z.string(),
     slug: z.string(),
+    project_context: z.string(),
     created_at: z.string().datetime().optional(),
     automerge_fix_prs: automergePolicySchema,
     automerge_method: automergeMethodSchema,

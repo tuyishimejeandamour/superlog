@@ -8,6 +8,7 @@ import { resolveActiveOrgContext } from "./org-context.js";
 type Vars = { userId: string; orgId: string | null };
 
 const ORG_INSTRUCTIONS_MAX_LEN = 8000;
+const PROJECT_CONTEXT_MAX_LEN = 8000;
 
 const PROJECT_SLUG_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 const PROJECT_NAME_MAX_LEN = 80;
@@ -176,7 +177,12 @@ export function mountSettingsAuthed(app: Hono<any>): void {
       orderBy: [asc(schema.projects.createdAt)],
     });
     return c.json({
-      projects: rows.map((p) => ({ id: p.id, name: p.name, slug: p.slug })),
+      projects: rows.map((p) => ({
+        id: p.id,
+        name: p.name,
+        slug: p.slug,
+        projectContext: p.projectContext,
+      })),
     });
   });
 
@@ -186,6 +192,7 @@ export function mountSettingsAuthed(app: Hono<any>): void {
     const body = (await c.req.json().catch(() => ({}))) as {
       name?: unknown;
       slug?: unknown;
+      projectContext?: unknown;
     };
     const name = typeof body.name === "string" ? body.name.trim() : "";
     if (!name) return c.json({ error: "name is required" }, 400);
@@ -206,14 +213,29 @@ export function mountSettingsAuthed(app: Hono<any>): void {
 
     const [project] = await db
       .insert(schema.projects)
-      .values({ orgId: ctx.orgId, name, slug: slugInput })
+      .values({
+        orgId: ctx.orgId,
+        name,
+        slug: slugInput,
+        projectContext:
+          typeof body.projectContext === "string"
+            ? body.projectContext.slice(0, PROJECT_CONTEXT_MAX_LEN)
+            : "",
+      })
       .returning();
     if (!project) return c.json({ error: "failed to create project" }, 500);
     await db
       .insert(schema.projectAutomationSettings)
       .values({ projectId: project.id })
       .onConflictDoNothing({ target: schema.projectAutomationSettings.projectId });
-    return c.json({ project: { id: project.id, name: project.name, slug: project.slug } });
+    return c.json({
+      project: {
+        id: project.id,
+        name: project.name,
+        slug: project.slug,
+        projectContext: project.projectContext,
+      },
+    });
   });
 
   app.patch("/api/org/projects/:projectId", async (c) => {
@@ -225,7 +247,11 @@ export function mountSettingsAuthed(app: Hono<any>): void {
     });
     if (!target) return c.json({ error: "project not found" }, 404);
 
-    const body = (await c.req.json().catch(() => ({}))) as { name?: unknown; slug?: unknown };
+    const body = (await c.req.json().catch(() => ({}))) as {
+      name?: unknown;
+      slug?: unknown;
+      projectContext?: unknown;
+    };
     const patch: Partial<typeof schema.projects.$inferInsert> = {};
     if (typeof body.name === "string") {
       const name = body.name.trim();
@@ -248,8 +274,18 @@ export function mountSettingsAuthed(app: Hono<any>): void {
         patch.slug = slug;
       }
     }
+    if (typeof body.projectContext === "string") {
+      patch.projectContext = body.projectContext.slice(0, PROJECT_CONTEXT_MAX_LEN);
+    }
     if (Object.keys(patch).length === 0) {
-      return c.json({ project: { id: target.id, name: target.name, slug: target.slug } });
+      return c.json({
+        project: {
+          id: target.id,
+          name: target.name,
+          slug: target.slug,
+          projectContext: target.projectContext,
+        },
+      });
     }
     const [updated] = await db
       .update(schema.projects)
@@ -260,7 +296,12 @@ export function mountSettingsAuthed(app: Hono<any>): void {
     // `updated` undefined — return a clean 404 rather than a TypeError 500.
     if (!updated) return c.json({ error: "project not found" }, 404);
     return c.json({
-      project: { id: updated.id, name: updated.name, slug: updated.slug },
+      project: {
+        id: updated.id,
+        name: updated.name,
+        slug: updated.slug,
+        projectContext: updated.projectContext,
+      },
     });
   });
 

@@ -747,7 +747,7 @@ export function useUninstallLinear() {
   });
 }
 
-export type OrgProject = { id: string; name: string; slug: string };
+export type OrgProject = { id: string; name: string; slug: string; projectContext: string };
 
 export function useOrgProjects() {
   const fetcher = useFetcher();
@@ -779,7 +779,7 @@ export function useUpdateOrgProject() {
       patch,
     }: {
       projectId: string;
-      patch: { name?: string; slug?: string };
+      patch: { name?: string; slug?: string; projectContext?: string };
     }) =>
       fetcher<{ project: OrgProject }>(`/api/org/projects/${projectId}`, {
         method: "PATCH",
