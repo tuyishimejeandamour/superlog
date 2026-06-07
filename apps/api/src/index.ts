@@ -33,11 +33,17 @@ import { shouldRunMigrationsOnBoot } from "./boot-migrations.js";
 import { mountDashboards } from "./dashboards.js";
 import { mountFeedbackAuthed, mountFeedbackPublic } from "./feedback.js";
 import { type GatewayVars, mountGateway } from "./gateway.js";
-import { mountGithubAuthed, mountGithubAuthorOAuth, mountGithubPublic } from "./github.js";
+import {
+  closeAgentPullRequestOnGithub,
+  mountGithubAuthed,
+  mountGithubAuthorOAuth,
+  mountGithubPublic,
+} from "./github.js";
 import { createApiHttpObservabilityMiddleware } from "./http-observability.js";
 import { mountImpersonation } from "./impersonation.js";
 import { buildIncidentListItem, shouldInlineIncidentListStats } from "./incidents/list.js";
 import { getPrDeliveryRetryEligibility } from "./incidents/pr-retry.js";
+import { runResolvedIncidentSideEffectsForIncident } from "./incidents/resolution-side-effects.js";
 import {
   buildIncidentStatsFromActivityRows,
   buildIncidentStatsFromIssues,
@@ -1317,13 +1323,24 @@ app.patch("/api/projects/:projectId/incidents/:incidentId", async (c) => {
   if (status === "resolved") {
     // Route the dashboard's mark-resolved through the shared helper so the
     // resolved_* columns are populated exactly like every other resolve path.
-    await resolveIncident({
+    const { resolved } = await resolveIncident({
       incidentId,
       kind: "dashboard_manual",
       reasonCode: "dashboard_manual",
       reasonText: `Resolved from the dashboard by user ${c.var.userId}.`,
       resolvedByUserId: c.var.userId,
     });
+    if (resolved) {
+      await runResolvedIncidentSideEffectsForIncident({
+        incidentId,
+        closePullRequest: (pr) =>
+          closeAgentPullRequestOnGithub({
+            installationId: pr.githubInstallationId,
+            repoFullName: pr.repoFullName,
+            prNumber: pr.prNumber,
+          }),
+      });
+    }
   } else {
     await incidentLifecycle.reopenManually({
       incident: existing,
@@ -1393,6 +1410,17 @@ async function decideResolutionProposal(
       throw new HTTPException(409, { message: result.reason });
     }
     throw new HTTPException(400, { message: result.reason ?? "decision failed" });
+  }
+  if (decision === "confirm" && result.incidentId) {
+    await runResolvedIncidentSideEffectsForIncident({
+      incidentId: result.incidentId,
+      closePullRequest: (pr) =>
+        closeAgentPullRequestOnGithub({
+          installationId: pr.githubInstallationId,
+          repoFullName: pr.repoFullName,
+          prNumber: pr.prNumber,
+        }),
+    });
   }
   return c.json({ ok: true, incidentId, proposalId, decision });
 }

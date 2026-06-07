@@ -13,6 +13,8 @@ import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { recordFeedback } from "./feedback.js";
 import { getDeviceFlow, getSkillDeviceForIntegration } from "./gateway.js";
+import { closeAgentPullRequestOnGithub } from "./github.js";
+import { runResolvedIncidentSideEffectsForIncident } from "./incidents/resolution-side-effects.js";
 import { logger } from "./logger.js";
 import { resolveActiveOrgContext } from "./org-context.js";
 
@@ -334,6 +336,16 @@ async function handleSlackResolveIncident(
     return;
   }
 
+  await runResolvedIncidentSideEffectsForIncident({
+    incidentId,
+    closePullRequest: (pr) =>
+      closeAgentPullRequestOnGithub({
+        installationId: pr.githubInstallationId,
+        repoFullName: pr.repoFullName,
+        prNumber: pr.prNumber,
+      }),
+  });
+
   const installation = await findInstallationForTeam(payload.team?.id ?? "");
   if (!installation) {
     log.warn({ team_id: payload.team?.id, incidentId }, "no installation to post resolve reply");
@@ -376,6 +388,17 @@ async function handleProposalDecision(
       "proposal decision rejected (race or unknown id)",
     );
     return;
+  }
+  if (decision === "confirm" && result.incidentId) {
+    await runResolvedIncidentSideEffectsForIncident({
+      incidentId: result.incidentId,
+      closePullRequest: (pr) =>
+        closeAgentPullRequestOnGithub({
+          installationId: pr.githubInstallationId,
+          repoFullName: pr.repoFullName,
+          prNumber: pr.prNumber,
+        }),
+    });
   }
   const installation = await findInstallationForTeam(payload.team?.id ?? "");
   if (!installation) return;

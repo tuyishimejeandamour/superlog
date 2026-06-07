@@ -14,6 +14,7 @@ import {
   postIncidentThreadMessage,
   updateIncidentMainMessage,
 } from "../infra/slack/incident-messages.js";
+import { closeOpenPullRequestsForResolvedIncident } from "../incidents/resolution-side-effects.js";
 import { logger } from "../logger.js";
 import { enqueueAgentRunCompleted } from "../webhooks.js";
 import { recordFiledLinearTicket } from "./deliverable-records.js";
@@ -27,7 +28,7 @@ async function resolveIncidentFromAgentRunConclusion(
   ctx: AgentRunContext,
   result: AgentRunResult,
   reason: schema.IncidentResolutionReason,
-): Promise<number> {
+): Promise<{ resolved: boolean; resolvedIssueCount: number }> {
   const now = new Date();
   const evidence = result.resolutionClassification?.evidence?.trim() ?? null;
   // For `fixed_in_current_code`, prod will keep producing the same exception
@@ -39,7 +40,7 @@ async function resolveIncidentFromAgentRunConclusion(
       ? new Date(now.getTime() + FIXED_IN_CURRENT_CODE_COOLDOWN_MS)
       : null;
 
-  const { resolvedIssueCount } = await incidentLifecycle.resolve({
+  return incidentLifecycle.resolve({
     incidentId: ctx.incident.id,
     kind: "agent_classification",
     reasonCode: reason,
@@ -55,8 +56,6 @@ async function resolveIncidentFromAgentRunConclusion(
     resolvedAt: now,
     autoInvestigateSuppressedUntil,
   });
-
-  return resolvedIssueCount;
 }
 
 export async function completeWithoutPullRequest(
@@ -95,11 +94,16 @@ export async function completeWithoutPullRequest(
   );
   await recordFiledLinearTicket(ctx, result.linearTicket);
   if (resolutionReason) {
-    await resolveIncidentFromAgentRunConclusion(ctx, result, resolutionReason);
+    const { resolved } = await resolveIncidentFromAgentRunConclusion(ctx, result, resolutionReason);
+    if (resolved) {
+      await closeOpenPullRequestsForResolvedIncident(ctx.incident.id);
+    }
     const refreshed = await db.query.incidents.findFirst({
       where: eq(schema.incidents.id, ctx.incident.id),
     });
     if (refreshed) ctx.incident = refreshed;
+  } else if (metadataOutcome.noiseResolved) {
+    await closeOpenPullRequestsForResolvedIncident(ctx.incident.id);
   }
   logger.info(
     {
