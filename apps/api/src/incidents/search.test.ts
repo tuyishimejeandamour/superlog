@@ -37,6 +37,7 @@ test("summary is a compact, agent-friendly projection with ISO timestamps", () =
   assert.equal(summary.codename, "steady-amber");
   assert.equal(summary.title, "Checkout failures");
   assert.equal(summary.service, "api");
+  assert.equal(summary.environment, "production");
   assert.equal(summary.severity, "SEV-2");
   assert.equal(summary.status, "open");
   assert.equal(summary.issueCount, 1);
@@ -71,6 +72,7 @@ function baseIncident(): Incident {
     id: "incident-1",
     projectId: "project-1",
     service: "api",
+    environment: "production",
     title: "Checkout failures",
     codename: "steady-amber",
     severity: "SEV-2",

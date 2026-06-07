@@ -25,6 +25,7 @@ export function createIncidentRepository(database: DB) {
     createOpenIncident(opts: {
       projectId: string;
       service: string | null;
+      environment?: string | null;
       title: string;
       codename: string;
       firstSeen: Date;
@@ -35,6 +36,7 @@ export function createIncidentRepository(database: DB) {
         .values({
           projectId: opts.projectId,
           service: opts.service,
+          environment: opts.environment ?? null,
           title: opts.title,
           codename: opts.codename,
           status: "open",

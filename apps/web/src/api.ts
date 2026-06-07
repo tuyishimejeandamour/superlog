@@ -1369,6 +1369,10 @@ export type Incident = {
   id: string;
   projectId: string;
   service: string | null;
+  // Deployment environment of the error that opened the incident, denormalized
+  // from the triggering issue's telemetry resource attributes. Null when the
+  // error carried no `deployment.environment` attribute.
+  environment: string | null;
   title: string;
   codename: string;
   severity: IncidentSeverity | null;

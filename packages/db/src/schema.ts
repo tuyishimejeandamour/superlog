@@ -467,6 +467,12 @@ export const incidents = pgTable(
       .notNull()
       .references(() => projects.id, { onDelete: "cascade" }),
     service: text("service"),
+    // Deployment environment (e.g. "production", "staging") of the error that
+    // opened the incident, denormalized from the triggering issue's telemetry
+    // resource attributes (same pattern as `service`). Nullable: many setups
+    // don't tag a `deployment.environment` attribute, and pre-this-column rows
+    // never captured it.
+    environment: text("environment"),
     title: text("title").notNull(),
     // Human-friendly per-project name (e.g. "squishy-narwhal"). Stable for the life of the incident.
     codename: text("codename").notNull().default(""),

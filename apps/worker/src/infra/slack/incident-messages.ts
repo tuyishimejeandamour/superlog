@@ -1,12 +1,8 @@
-import { db, schema } from "@superlog/db";
+import { db, environmentFromResourceAttrs, schema } from "@superlog/db";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { logger } from "../../logger.js";
 import { isStaleSlackAnchorError } from "../../slack-pinning.js";
-import {
-  postSlackMessage,
-  type SlackTarget,
-  updateSlackMessage,
-} from "./api.js";
+import { type SlackTarget, postSlackMessage, updateSlackMessage } from "./api.js";
 
 const WEB_ORIGIN = process.env.WEB_ORIGIN ?? "http://localhost:5173";
 
@@ -80,15 +76,20 @@ export function incidentBlocks(opts: {
   tagline?: string | null;
   projectName: string;
   service?: string | null;
+  environment?: string | null;
   buttons: Array<{ text: string; url: string; actionId: string }>;
   incidentId?: string;
   showResolveButton?: boolean;
 }): unknown[] {
   const lines = [`:${opts.emoji}: *${opts.status}*`, `*${opts.title}*`];
   if (opts.tagline) lines.push(`_${opts.tagline}_`);
-  lines.push(
-    opts.service ? `\`${opts.projectName}\` · \`${opts.service}\`` : `\`${opts.projectName}\``,
-  );
+  // `project · service · environment`, each a code chip; service/environment
+  // only appear when present on the triggering error.
+  const context = [opts.projectName, opts.service, opts.environment]
+    .filter((part): part is string => Boolean(part))
+    .map((part) => `\`${part}\``)
+    .join(" · ");
+  lines.push(context);
   const blocks: unknown[] = [{ type: "section", text: { type: "mrkdwn", text: lines.join("\n") } }];
   const elements: unknown[] = opts.buttons.map((btn) => ({
     type: "button",
@@ -194,6 +195,9 @@ export async function postIncidentRootMessage(opts: {
     title: opts.firstIssue.title,
     projectName: opts.projectName,
     service: opts.firstIssue.service,
+    environment:
+      opts.incident.environment ??
+      environmentFromResourceAttrs(opts.firstIssue.lastSample?.resourceAttrs),
     buttons: [{ text: "Open in Superlog", url: incidentUrl, actionId: "open_superlog" }],
     incidentId: opts.incident.id,
     showResolveButton: true,
@@ -217,6 +221,7 @@ async function createIncidentRootInCurrentRoute(
     title: incident.title,
     projectName: project?.name ?? incident.projectId,
     service: incident.service,
+    environment: incident.environment,
     buttons: [{ text: "Open in Superlog", url: incidentUrl, actionId: "open_superlog" }],
     incidentId: incident.id,
     showResolveButton: true,

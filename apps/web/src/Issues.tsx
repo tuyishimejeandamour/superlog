@@ -4,7 +4,6 @@ import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState }
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { type EvidenceLinkContext, EvidenceMarkdown } from "./EvidenceMarkdown.tsx";
 import { FeedbackTrigger } from "./FeedbackDialog.tsx";
-import { getIssueIncidentLinkState } from "./issue-incident-link-state.ts";
 import { LogDrawer } from "./LogDetail.tsx";
 import { TraceDrawer } from "./TraceDetail.tsx";
 import {
@@ -34,6 +33,7 @@ import {
   useUpdateIncident,
 } from "./api.ts";
 import { Btn, Chip } from "./design/ui.tsx";
+import { getIssueIncidentLinkState } from "./issue-incident-link-state.ts";
 
 type IssueFilter = "active" | "silenced" | "all";
 type IncidentStatus = "open" | "resolved" | "autoresolved_noise" | "all";
@@ -279,9 +279,7 @@ export function IssueRow({
             {issue.silencedAt && <Chip tone="neutral">silenced</Chip>}
             <GroupingChip state={issue.groupingState} />
             <span className="font-mono text-[11px] text-muted">{issue.exceptionType}</span>
-            {issue.service && (
-              <span className="font-mono text-[11px] text-subtle">{issue.service}</span>
-            )}
+            <ServiceEnv service={issue.service} environment={issueEnvironment(issue)} />
           </div>
           <p className="truncate text-[13px] font-medium text-fg">{issue.title}</p>
           {issue.message && (
@@ -427,6 +425,7 @@ function IssueDetailContent({
 
       <div className="grid grid-cols-2 gap-3">
         <MetaField label="Service" value={issue.service ?? "—"} />
+        <MetaField label="Environment" value={issueEnvironment(issue) ?? "—"} />
         <MetaField label="Events" value={fmtCount(issue.eventCount)} />
         <MetaField label="First seen" value={fmtRelative(issue.firstSeen)} />
         <MetaField label="Last seen" value={fmtRelative(issue.lastSeen)} />
@@ -731,9 +730,7 @@ export function IncidentRow({
         <div className="min-w-0 flex-1">
           <div className="mb-1 flex items-center gap-2">
             {incident.severity && <SeverityChip severity={incident.severity} />}
-            {incident.service && (
-              <span className="font-mono text-[11px] text-subtle">{incident.service}</span>
-            )}
+            <ServiceEnv service={incident.service} environment={incident.environment} />
             {pendingResolutionProposal && <RecoveryDetectedBadge />}
           </div>
           <p className="truncate text-[13px] font-medium text-fg">{incident.title}</p>
@@ -893,6 +890,7 @@ function buildAgentRunPrompt({
     `- Severity: ${incident.severity ?? "unset"}`,
     `- Status: ${incident.status}`,
     `- Service: ${incident.service ?? "unknown"}`,
+    `- Environment: ${incident.environment ?? "unknown"}`,
     `- First seen: ${incident.firstSeen}`,
     `- Last seen: ${incident.lastSeen}`,
     `- Incident ID: ${incident.id}`,
@@ -907,6 +905,7 @@ function buildAgentRunPrompt({
       lines.push(
         `${i + 1}. ${issue.exceptionType}: ${issue.title}`,
         `   - Service: ${issue.service ?? "unknown"}`,
+        `   - Environment: ${issueEnvironment(issue) ?? "unknown"}`,
         `   - Message: ${issue.message ?? "(none)"}`,
         `   - Top frame: ${issue.topFrame ?? "(none)"}`,
         `   - Symbolicated top frame: ${formatSymbolicatedTopFrame(issue) ?? "(none)"}`,
@@ -1365,7 +1364,10 @@ export function IncidentDetailContent({
       </div>
 
       <div className="space-y-2">
-        <MetaField label="Service" value={incident.service ?? "—"} />
+        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+          <MetaInline label="Service" value={incident.service ?? "—"} />
+          <MetaInline label="Environment" value={incident.environment ?? "—"} />
+        </div>
         <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
           <MetaInline label="First seen" value={fmtRelative(incident.firstSeen)} />
           <MetaInline label="Last seen" value={fmtRelative(incident.lastSeen)} />
@@ -2736,6 +2738,36 @@ function eventTargetFromIssue(issue: Issue): NonNullable<EventTarget> | null {
 
 function KindChip({ issue }: { issue: Issue }) {
   return <Chip tone={kindTone(issue.kind)}>{kindLabel(issue.kind)}</Chip>;
+}
+
+// Deployment environment ("production", "staging", …) read off a telemetry
+// resource-attr map. Mirrors `environmentFromResourceAttrs` in @superlog/db —
+// keep the key list in sync.
+function environmentFromAttrs(attrs: Record<string, string> | null | undefined): string | null {
+  if (!attrs) return null;
+  for (const key of ["deployment.environment.name", "deployment.environment", "env"]) {
+    const value = attrs[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function issueEnvironment(issue: Issue): string | null {
+  return environmentFromAttrs(issue.lastSample?.resourceAttrs);
+}
+
+// `service | environment`, joined in one same-font run. Either side is dropped
+// when missing; renders nothing when both are absent.
+function ServiceEnv({
+  service,
+  environment,
+}: {
+  service: string | null | undefined;
+  environment: string | null | undefined;
+}) {
+  const parts = [service, environment].filter((part): part is string => Boolean(part));
+  if (parts.length === 0) return null;
+  return <span className="font-mono text-[11px] text-subtle">{parts.join(" | ")}</span>;
 }
 
 function GroupingChip({ state }: { state: Issue["groupingState"] }) {

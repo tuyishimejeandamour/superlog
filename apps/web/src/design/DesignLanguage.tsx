@@ -7,7 +7,6 @@ import {
   TimeseriesChart,
   TracesTable,
 } from "../Explore.tsx";
-import { RANGE_PRESETS, RangePicker, type RangeSelection } from "./RangePicker.tsx";
 import {
   IncidentDetailContent,
   IncidentRow,
@@ -15,14 +14,9 @@ import {
   IssueRow,
   fmtRelative,
 } from "../Issues.tsx";
-import type {
-  Incident,
-  IncidentListItem,
-  AgentRun,
-  IncidentEvent,
-  Issue,
-} from "../api.ts";
+import type { AgentRun, Incident, IncidentEvent, IncidentListItem, Issue } from "../api.ts";
 import { AgentKeyStep } from "../onboarding/OnboardingWizard.tsx";
+import { RANGE_PRESETS, RangePicker, type RangeSelection } from "./RangePicker.tsx";
 import { OrgSwitcherPlayground } from "./org-switcher/Playground.tsx";
 import { ServiceMapPlayground } from "./service-map/Playground.tsx";
 import { SuperlogOnboardingPlayground } from "./superlog-onboarding/Playground.tsx";
@@ -422,8 +416,7 @@ function ColorBento() {
           className="mb-4 h-48 w-full"
           style={{
             background: "#485AE2",
-            boxShadow:
-              "0 0 40px -6px rgba(72,90,226,0.46), inset 0 0 0 1px rgba(255,255,255,0.07)",
+            boxShadow: "0 0 40px -6px rgba(72,90,226,0.46), inset 0 0 0 1px rgba(255,255,255,0.07)",
           }}
         />
         <div className="flex items-baseline justify-between">
@@ -1360,6 +1353,7 @@ const INCIDENT_FIXTURE: Incident = {
   id: "inc-1",
   projectId: "p1",
   service: "checkout-api",
+  environment: "production",
   title: "checkout-api can't reach Stripe on the EU charge path",
   codename: "squishy-narwhal",
   severity: "SEV-2",
