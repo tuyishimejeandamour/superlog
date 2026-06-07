@@ -36,6 +36,7 @@ export function Dropdown({
   const [highlight, setHighlight] = useState(0);
   const ref = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
 
   const selected = options.find((o) => o.value === value);
 
@@ -45,20 +46,25 @@ export function Dropdown({
     return options.filter((o) => (o.searchText ?? o.value).toLowerCase().includes(q));
   }, [options, query]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: initialize selection only when the menu opens.
   useEffect(() => {
     if (!open) return;
     setQuery("");
     const idx = options.findIndex((o) => o.value === value);
     setHighlight(idx >= 0 ? idx : 0);
-    setTimeout(() => inputRef.current?.focus(), 0);
+    setTimeout(() => {
+      if (searchable) {
+        inputRef.current?.focus();
+      } else {
+        listRef.current?.focus();
+      }
+    }, 0);
     const onDoc = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     window.addEventListener("mousedown", onDoc);
     return () => window.removeEventListener("mousedown", onDoc);
-    // Only re-init when the menu opens; `filtered`/`value` are read once here.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, searchable]);
 
   // Keep the highlight in range as the filter narrows the list.
   useEffect(() => {
@@ -93,7 +99,7 @@ export function Dropdown({
       <button
         type="button"
         disabled={disabled}
-        aria-haspopup="listbox"
+        aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
         className="flex h-9 w-full items-center gap-2 rounded-sm border border-border bg-surface-2 px-3 text-left text-[13px] text-fg transition-colors hover:border-border-strong focus:border-border-strong focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
@@ -105,7 +111,9 @@ export function Dropdown({
       </button>
       {open && (
         <div
-          role="listbox"
+          ref={listRef}
+          tabIndex={-1}
+          onKeyDown={onKey}
           className="absolute left-0 top-full z-20 mt-1.5 w-full overflow-hidden rounded-lg border border-border bg-surface shadow-[0_10px_30px_-10px_rgba(0,0,0,0.4)]"
         >
           {searchable && (
@@ -120,7 +128,7 @@ export function Dropdown({
               />
             </div>
           )}
-          <div className="max-h-64 overflow-y-auto p-1" onKeyDown={onKey}>
+          <div className="max-h-64 overflow-y-auto p-1 focus:outline-none">
             {filtered.length === 0 ? (
               <div className="px-2.5 py-2 text-[12px] text-subtle">{emptyLabel}</div>
             ) : (
@@ -131,8 +139,7 @@ export function Dropdown({
                   <button
                     key={opt.value}
                     type="button"
-                    role="option"
-                    aria-selected={active}
+                    aria-pressed={active}
                     onClick={() => apply(opt.value)}
                     onMouseEnter={() => setHighlight(i)}
                     className={`flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors ${
@@ -162,6 +169,7 @@ function ChevronIcon() {
       strokeWidth="2"
       aria-hidden
     >
+      <title>Open dropdown</title>
       <path d="m6 9 6 6 6-6" />
     </svg>
   );
@@ -179,6 +187,7 @@ function CheckIcon() {
       strokeLinejoin="round"
       aria-hidden
     >
+      <title>Selected</title>
       <path d="m5 13 4 4L19 7" />
     </svg>
   );

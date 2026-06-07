@@ -1003,6 +1003,7 @@ export async function listSlackChannels(
     cursor = data.response_metadata?.next_cursor || undefined;
     if (!cursor) break;
   }
+  if (cursor) return { ok: false, error: "pagination_limit_exceeded" };
   return { ok: true, channels };
 }
 

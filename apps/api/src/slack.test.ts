@@ -55,8 +55,8 @@ test("listSlackChannels requests both public and private channels", async () => 
   await listSlackChannels("xoxb-token", fetchImpl);
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0]!.searchParams.get("types"), "public_channel,private_channel");
-  assert.equal(calls[0]!.searchParams.get("exclude_archived"), "true");
+  assert.equal(calls[0]?.searchParams.get("types"), "public_channel,private_channel");
+  assert.equal(calls[0]?.searchParams.get("exclude_archived"), "true");
 });
 
 test("listSlackChannels follows cursor pagination and aggregates all channels", async () => {
@@ -77,7 +77,7 @@ test("listSlackChannels follows cursor pagination and aggregates all channels", 
 
   assert.equal(result.ok, true);
   assert.equal(calls.length, 2);
-  assert.equal(calls[1]!.searchParams.get("cursor"), "page2");
+  assert.equal(calls[1]?.searchParams.get("cursor"), "page2");
   assert.ok(result.ok);
   assert.deepEqual(result.channels, [
     { id: "C1", name: "general", isPrivate: false },
@@ -97,4 +97,22 @@ test("listSlackChannels returns the Slack error without paginating further", asy
   assert.equal(calls.length, 1);
   assert.ok(!result.ok);
   assert.equal(result.error, "token_revoked");
+});
+
+test("listSlackChannels returns an error when the page cap is exhausted", async () => {
+  const { listSlackChannels } = await import("./slack.js");
+  const { fetchImpl, calls } = fakeFetch(
+    Array.from({ length: 50 }, (_, i) => ({
+      ok: true,
+      channels: [{ id: `C${i}`, name: `channel-${i}` }],
+      cursor: `page-${i + 1}`,
+    })),
+  );
+
+  const result = await listSlackChannels("xoxb-token", fetchImpl);
+
+  assert.equal(calls.length, 50);
+  assert.equal(result.ok, false);
+  assert.ok(!result.ok);
+  assert.equal(result.error, "pagination_limit_exceeded");
 });
