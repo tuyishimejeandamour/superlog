@@ -91,6 +91,7 @@ export function createIncidentLifecycle(database: DB = db) {
     async createOpen(opts: {
       projectId: string;
       service: string | null;
+      environment?: string | null;
       title: string;
       firstSeen: Date;
       lastSeen: Date;

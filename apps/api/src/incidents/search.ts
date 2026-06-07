@@ -44,6 +44,7 @@ export type IncidentSummary = {
   codename: string;
   title: string;
   service: string | null;
+  environment: string | null;
   severity: IncidentSeverity | null;
   status: IncidentStatus;
   firstSeen: string;
@@ -72,6 +73,7 @@ export function toIncidentSummary(incident: Incident): IncidentSummary {
     codename: incident.codename,
     title: incident.title,
     service: incident.service,
+    environment: incident.environment,
     severity: incident.severity,
     status: incident.status,
     firstSeen: incident.firstSeen.toISOString(),

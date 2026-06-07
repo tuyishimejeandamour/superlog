@@ -49,6 +49,7 @@ function baseInput(): IncidentListItemInput {
       id: "incident-1",
       projectId: "project-1",
       service: "api",
+      environment: "production",
       title: "Checkout failures",
       codename: "steady-amber",
       severity: "SEV-2",

@@ -10,15 +10,15 @@
 // reason) so the operator can audit why something landed where it did.
 //
 // All collaborators are injected; the real wiring lives in incident-intake.ts.
-import type { schema } from "@superlog/db";
+import { environmentFromResourceAttrs, type schema } from "@superlog/db";
 import type { GroupingCandidateIncident, GroupingVerdict } from "../grouping/domain.js";
 import {
   type IncidentMatch,
   type IssueGroupingSource,
+  type LinkedIncidentIssue,
   buildGroupingCandidate,
   findHeuristicIncidentMatch,
   groupingIssueInput,
-  type LinkedIncidentIssue,
 } from "../issues/domain.js";
 
 export type IntakeLogger = {
@@ -57,6 +57,7 @@ export type IntakeLifecycle = {
   createOpen(opts: {
     projectId: string;
     service: string | null;
+    environment?: string | null;
     title: string;
     firstSeen: Date;
     lastSeen: Date;
@@ -119,6 +120,7 @@ export async function ensureIncidentForIssueWorkflow(
     incident = await deps.lifecycle.createOpen({
       projectId: issue.projectId,
       service: issue.service,
+      environment: environmentFromResourceAttrs(issue.lastSample?.resourceAttrs),
       title: issue.title,
       firstSeen: issue.firstSeen,
       lastSeen: issue.lastSeen,
@@ -158,10 +160,7 @@ async function findHeuristicMatchingIncident(
   return findHeuristicIncidentMatch(issue, candidates, linked);
 }
 
-async function findLlmMatchingIncident(
-  issue: schema.Issue,
-  deps: IntakeDeps,
-): Promise<Grouping> {
+async function findLlmMatchingIncident(issue: schema.Issue, deps: IntakeDeps): Promise<Grouping> {
   const candidates = await deps.repo.findOpenIncidentCandidates(issue, { filterService: false });
   if (candidates.length === 0) {
     return {

@@ -161,3 +161,4 @@ export type {
   LoopsWelcomeFlowInput,
   SendLoopsResult,
 } from "./loops.js";
+export { environmentFromResourceAttrs } from "./telemetry-environment.js";

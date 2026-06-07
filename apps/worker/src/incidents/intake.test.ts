@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { schema } from "@superlog/db";
 import {
-  ensureIncidentForIssueWorkflow,
   type IntakeDeps,
   type IntakeLifecycle,
   type IntakeRepository,
+  ensureIncidentForIssueWorkflow,
 } from "./intake.js";
 
 const NOW = new Date("2026-05-23T10:00:00Z");
@@ -75,8 +75,8 @@ function makeRepo(opts: {
     async findOpenIncidentCandidates(_issue, queryOpts) {
       opts.calls.push(`findOpenIncidentCandidates:${queryOpts.filterService}`);
       return queryOpts.filterService
-        ? opts.openCandidates?.withService ?? []
-        : opts.openCandidates?.withoutService ?? [];
+        ? (opts.openCandidates?.withService ?? [])
+        : (opts.openCandidates?.withoutService ?? []);
     },
     async loadLinkedIncidentIssues(incidents) {
       opts.calls.push(`loadLinkedIncidentIssues:${incidents.length}`);
@@ -109,8 +109,13 @@ function makeLifecycle(opts: {
       return { reopened: opts.reopened ?? false };
     },
     async createOpen(input) {
-      opts.calls.push(`createOpen:${input.projectId}:${input.title}`);
-      return opts.createdIncident ?? makeIncident({ id: "inc-new", title: input.title });
+      opts.calls.push(
+        `createOpen:${input.projectId}:${input.title}:env=${input.environment ?? ""}`,
+      );
+      return (
+        opts.createdIncident ??
+        makeIncident({ id: "inc-new", title: input.title, environment: input.environment ?? null })
+      );
     },
   };
 }
@@ -125,8 +130,7 @@ function makeDeps(overrides: {
     repo: overrides.repo,
     lifecycle: overrides.lifecycle,
     analyzeGrouping:
-      overrides.analyzeGrouping ??
-      (async () => ({ decision: "standalone", evidence: null })),
+      overrides.analyzeGrouping ?? (async () => ({ decision: "standalone", evidence: null })),
     logger: {
       warn(_obj, msg) {
         overrides.calls.push(`logger.warn:${msg ?? ""}`);
@@ -184,16 +188,11 @@ test("intake: heuristic match links to existing incident as 'grouped'", async ()
   const issue = makeIssue({
     normalizedFrames: ["db.query", "pool.acquire", "handler.process"],
   });
-  const result = await ensureIncidentForIssueWorkflow(
-    issue,
-    makeDeps({ repo, lifecycle, calls }),
-  );
+  const result = await ensureIncidentForIssueWorkflow(issue, makeDeps({ repo, lifecycle, calls }));
   assert.equal(result.createdIncident, false);
   assert.equal(result.linkedIssue, true);
   assert.equal(result.incident.id, "inc-match");
-  assert.ok(
-    calls.some((c) => c.startsWith("updateIssueGrouping:iss-new:grouped:heuristic")),
-  );
+  assert.ok(calls.some((c) => c.startsWith("updateIssueGrouping:iss-new:grouped:heuristic")));
 });
 
 test("intake: alert issue with no heuristic match opens fresh incident, skips LLM", async () => {
@@ -220,6 +219,32 @@ test("intake: alert issue with no heuristic match opens fresh incident, skips LL
       ),
     ),
   );
+});
+
+test("intake: fresh incident captures environment from the issue's resource attrs", async () => {
+  const calls: string[] = [];
+  const repo = makeRepo({ calls });
+  const lifecycle = makeLifecycle({ calls });
+  const issue = makeIssue({
+    kind: "alert",
+    lastSample: {
+      kind: "span",
+      service: "api",
+      severity: null,
+      message: null,
+      body: null,
+      exceptionType: "ECONNREFUSED",
+      topFrame: null,
+      normalizedFrames: [],
+      stacktrace: null,
+      seenAt: NOW.toISOString(),
+      resourceAttrs: { "deployment.environment.name": "production" },
+    },
+  });
+  const result = await ensureIncidentForIssueWorkflow(issue, makeDeps({ repo, lifecycle, calls }));
+  assert.equal(result.createdIncident, true);
+  assert.equal(result.incident.environment, "production");
+  assert.ok(calls.some((c) => c.startsWith("createOpen:proj-1:") && c.endsWith(":env=production")));
 });
 
 test("intake: LLM 'join' verdict links to the chosen incident", async () => {
@@ -272,9 +297,7 @@ test("intake: LLM 'join' verdict links to the chosen incident", async () => {
   );
   assert.equal(result.incident.id, "inc-llm");
   assert.ok(calls.includes("updateIssueGrouping:iss-new:pending:llm:Waiting for LLM grouping."));
-  assert.ok(
-    calls.some((c) => c.startsWith("updateIssueGrouping:iss-new:grouped:llm")),
-  );
+  assert.ok(calls.some((c) => c.startsWith("updateIssueGrouping:iss-new:grouped:llm")));
 });
 
 test("intake: LLM 'join' verdict with unknown id falls back to standalone (and opens new incident)", async () => {
