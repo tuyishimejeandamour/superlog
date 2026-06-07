@@ -7,7 +7,7 @@ import {
   schema,
   syncLoopsContactsForOrg,
 } from "@superlog/db";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
@@ -228,7 +228,10 @@ async function handleSlackBlockActions(payload: SlackInteractivityPayload): Prom
     log.warn({ incidentId }, "give_feedback click for unknown incident");
     return;
   }
-  const installation = await findInstallationForTeam(payload.team?.id ?? "");
+  const installation = await installationForIncident({
+    pinnedId: incident.slackInstallationId,
+    teamId: payload.team?.id ?? "",
+  });
   if (!installation) {
     log.warn({ team_id: payload.team?.id, incidentId }, "no installation for feedback modal");
     return;
@@ -334,7 +337,10 @@ async function handleSlackResolveIncident(
     return;
   }
 
-  const installation = await findInstallationForTeam(payload.team?.id ?? "");
+  const installation = await installationForIncident({
+    pinnedId: incident.slackInstallationId,
+    teamId: payload.team?.id ?? "",
+  });
   if (!installation) {
     log.warn({ team_id: payload.team?.id, incidentId }, "no installation to post resolve reply");
     return;
@@ -377,9 +383,6 @@ async function handleProposalDecision(
     );
     return;
   }
-  const installation = await findInstallationForTeam(payload.team?.id ?? "");
-  if (!installation) return;
-
   // Re-render the proposal message: drop the buttons, swap in a status line
   // crediting the deciding user. The message lives in the incident thread,
   // so this update is non-destructive — the original incident root
@@ -388,6 +391,12 @@ async function handleProposalDecision(
     where: eq(schema.incidentResolutionProposals.id, proposalId),
   });
   if (!proposal?.slackChannelId || !proposal.slackMessageTs) return;
+
+  const installation = await installationForIncident({
+    pinnedId: proposal.slackInstallationId,
+    teamId: payload.team?.id ?? "",
+  });
+  if (!installation) return;
 
   const attribution = slackUserId ? `<@${slackUserId}>` : (slackUserName ?? "a teammate");
   const headerEmoji = decision === "confirm" ? ":white_check_mark:" : ":x:";
@@ -504,7 +513,59 @@ async function findInstallationForTeam(teamId: string) {
       eq(schema.slackInstallations.teamId, teamId),
       isNull(schema.slackInstallations.revokedAt),
     ),
+    // When a team owns multiple non-revoked rows (the same workspace installed
+    // into several projects) Slack keeps only the most-recently-minted bot
+    // token live, so order by token-refresh recency — `installedAt`, which is
+    // set on every (re)auth, NOT `createdAt`, which the in-place token refresh
+    // leaves stale. Legacy rows predating `installedAt` are NULL, so fall back
+    // to `createdAt` for them via coalesce rather than letting NULLs sort last.
+    // Still best-effort: for incident-scoped actions prefer
+    // installationForIncident, which uses the exact pinned installation. This
+    // team lookup is only the legacy/unpinned fallback.
+    orderBy: desc(
+      sql`coalesce(${schema.slackInstallations.installedAt}, ${schema.slackInstallations.createdAt})`,
+    ),
   });
+}
+
+// Apply the installation-selection precedence for incident-scoped Slack
+// interactions: the installation pinned to the incident/proposal — the exact
+// workspace + bot token that posted the thread — wins over any team-wide match.
+//
+// Why this matters: a workspace can be installed into more than one project,
+// and `upsertInstallation` keys rows by project (unique on project_id+team_id),
+// so one Slack team can own several non-revoked `slack_installations` rows.
+// Slack issues a fresh bot token on each (re)install and invalidates the prior
+// token, so only one of those rows holds a live token at a time. A team-wide
+// `findFirst` can therefore return a stale row whose token fails every Slack
+// API call with `invalid_auth` — which is exactly what silently broke the
+// incident feedback modal (views.open -> invalid_auth, so the modal never
+// opened and the click looked like a no-op). The pin is exact, so honour it
+// first; the team match is only a fallback for legacy rows written before the
+// pin existed.
+export function preferPinnedInstallation<T>(
+  pinned: T | null | undefined,
+  teamFallback: T | null | undefined,
+): T | null {
+  return pinned ?? teamFallback ?? null;
+}
+
+// Resolve the Slack installation to act through for an incident or proposal,
+// preferring its pinned installation id (see preferPinnedInstallation). The
+// team lookup only runs when there is no usable pin.
+async function installationForIncident(opts: { pinnedId: string | null; teamId: string }) {
+  const pinned = opts.pinnedId
+    ? await db.query.slackInstallations.findFirst({
+        where: and(
+          eq(schema.slackInstallations.id, opts.pinnedId),
+          isNull(schema.slackInstallations.revokedAt),
+        ),
+      })
+    : null;
+  return preferPinnedInstallation(
+    pinned,
+    pinned ? null : await findInstallationForTeam(opts.teamId),
+  );
 }
 
 function truncateModalText(text: string): string {
@@ -687,6 +748,7 @@ async function upsertInstallation(v: {
       botAccessToken: v.botAccessToken,
       scope: v.scope,
       installedByUserId: v.installedByUserId,
+      installedAt: new Date(),
     })
     .onConflictDoUpdate({
       target: [schema.slackInstallations.projectId, schema.slackInstallations.teamId],
@@ -697,6 +759,10 @@ async function upsertInstallation(v: {
         scope: v.scope,
         installedByUserId: v.installedByUserId,
         revokedAt: null,
+        // Reinstall mints a fresh bot token and invalidates the old one, so
+        // record the refresh time — this is what the team-wide fallback orders
+        // by to find the row holding the currently-live token.
+        installedAt: new Date(),
       },
     });
 }

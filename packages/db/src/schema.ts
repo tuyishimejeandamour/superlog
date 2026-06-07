@@ -1178,6 +1178,20 @@ export const slackInstallations = pgTable(
     channelName: text("channel_name"),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    // Set on every (re)authorization — i.e. whenever Slack mints a fresh bot
+    // token for this install. The upsert refreshes the token in place on
+    // reinstall, so `createdAt` does NOT track token-refresh recency;
+    // `installedAt` does. A workspace installed into several projects owns one
+    // non-revoked row per project but Slack keeps only the most-recently-minted
+    // bot token live, so when we must pick by team the highest `installedAt`
+    // wins. (Incident/proposal flows should still prefer the pinned install.)
+    //
+    // Nullable on purpose: rows that predate this column have no recorded
+    // refresh time (and `createdAt` is itself unreliable for in-place token
+    // refreshes), so we leave them NULL and `coalesce(installedAt, createdAt)`
+    // at query time rather than stamping every legacy row with the same
+    // migration timestamp. Every write below sets it explicitly.
+    installedAt: timestamp("installed_at", { withTimezone: true }),
   },
   (t) => ({
     projectTeamUniq: uniqueIndex("slack_installations_project_team_idx").on(t.projectId, t.teamId),
