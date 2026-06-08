@@ -1113,16 +1113,28 @@ export async function closeAgentPullRequestOnGithub(opts: {
   }
 }
 
+// Safety ceiling on paginated GitHub list calls: 100 pages × 100 per page =
+// 10k items. High enough to cover every realistic repo/branch count while
+// still bounding the loop so a pathological account can't spin it forever.
+const GITHUB_LIST_MAX_PAGES = 100;
+
 export async function listCurrentInstallationRepos(installationId: number): Promise<StoredRepo[]> {
   const token = await createInstallationReadToken(installationId);
   const repos: StoredRepo[] = [];
-  for (let page = 1; page <= 10; page += 1) {
+  let page = 1;
+  for (; page <= GITHUB_LIST_MAX_PAGES; page += 1) {
     const data = await githubRequest<GithubInstallationReposResponse>(
       `/installation/repositories?per_page=100&page=${page}`,
       token,
     );
     repos.push(...data.repositories.map(toStoredRepo));
     if (data.repositories.length < 100) break;
+  }
+  if (page > GITHUB_LIST_MAX_PAGES) {
+    log.warn(
+      { installationId, cap: GITHUB_LIST_MAX_PAGES * 100 },
+      "installation repo list hit the pagination cap; results may be truncated",
+    );
   }
   return repos;
 }
@@ -1160,13 +1172,20 @@ async function fetchRepoBranchInfo(
   const token = await createInstallationReadToken(installationId);
   const repo = await githubRequest<{ default_branch?: string }>(`/repos/${repoFullName}`, token);
   const branches: string[] = [];
-  for (let page = 1; page <= 10; page += 1) {
+  let page = 1;
+  for (; page <= GITHUB_LIST_MAX_PAGES; page += 1) {
     const data = await githubRequest<{ name: string }[]>(
       `/repos/${repoFullName}/branches?per_page=100&page=${page}`,
       token,
     );
     branches.push(...data.map((b) => b.name));
     if (data.length < 100) break;
+  }
+  if (page > GITHUB_LIST_MAX_PAGES) {
+    log.warn(
+      { repo: repoFullName, cap: GITHUB_LIST_MAX_PAGES * 100 },
+      "repo branch list hit the pagination cap; results may be truncated",
+    );
   }
   return { defaultBranch: repo.default_branch ?? null, branches };
 }
