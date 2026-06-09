@@ -5,7 +5,8 @@ import {
   listAccessibleGithubInstallsForProject,
   schema,
 } from "@superlog/db";
-import { and, asc, desc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { listActiveAgentMemories } from "./agent-memory-tools.js";
 import { buildAgentRunInstructions } from "./agent-run-instructions.js";
 import { listInstallationRepositories } from "./infra/github/repositories.js";
 import { logger } from "./logger.js";
@@ -45,23 +46,6 @@ export type AgentRunContext = {
   issueRows: Array<schema.Issue>;
   memories: Array<schema.AgentMemory>;
 };
-
-// Active memories visible to a run: org-wide rows (project_id null) plus rows
-// scoped to the run's project. Oldest first so the prompt reads in the order
-// the knowledge was learned.
-export async function listActiveAgentMemories(
-  orgId: string,
-  projectId: string,
-): Promise<schema.AgentMemory[]> {
-  return db.query.agentMemories.findMany({
-    where: and(
-      eq(schema.agentMemories.orgId, orgId),
-      eq(schema.agentMemories.status, "active"),
-      or(isNull(schema.agentMemories.projectId), eq(schema.agentMemories.projectId, projectId)),
-    ),
-    orderBy: [asc(schema.agentMemories.createdAt)],
-  });
-}
 
 export async function getProjectAutomation(projectId: string): Promise<{
   autoInvestigateIssuesEnabled: boolean;
