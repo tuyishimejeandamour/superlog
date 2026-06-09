@@ -1082,6 +1082,73 @@ export function useSaveOrgAgentSettings() {
   });
 }
 
+export type AgentMemoryKind = "feedback" | "terminology" | "infra" | "project";
+
+export type AgentMemory = {
+  id: string;
+  kind: AgentMemoryKind;
+  projectId: string | null;
+  title: string;
+  body: string;
+  status: "active" | "archived";
+  source: "agent" | "user" | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export function useOrgAgentMemories() {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["org-agent-memories"],
+    queryFn: () => fetcher<{ memories: AgentMemory[] }>("/api/org/agent-memories"),
+  });
+}
+
+export function useCreateOrgAgentMemory() {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { kind: AgentMemoryKind; title: string; body: string }) =>
+      fetcher<{ memory: AgentMemory }>("/api/org/agent-memories", {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["org-agent-memories"] }),
+  });
+}
+
+export function useUpdateOrgAgentMemory() {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      ...patch
+    }: {
+      id: string;
+      kind?: AgentMemoryKind;
+      title?: string;
+      body?: string;
+      status?: "active" | "archived";
+    }) =>
+      fetcher<{ memory: AgentMemory }>(`/api/org/agent-memories/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(patch),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["org-agent-memories"] }),
+  });
+}
+
+export function useDeleteOrgAgentMemory() {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetcher<{ ok: boolean }>(`/api/org/agent-memories/${id}`, { method: "DELETE" }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["org-agent-memories"] }),
+  });
+}
+
 export type OrgDigestSettings = {
   enabled: boolean;
   channelId: string | null;

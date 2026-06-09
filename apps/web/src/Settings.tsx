@@ -79,6 +79,7 @@ import {
 } from "./api";
 import { Dropdown, type DropdownOption } from "./design/Dropdown.tsx";
 import { Btn, Chip, FieldLabel, Input, Label, Tile } from "./design/ui";
+import { AgentMemoriesCard } from "./settings/AgentMemoriesCard.tsx";
 import { BillingCard } from "./settings/BillingCard.tsx";
 import { OrgGeneralCard } from "./settings/OrgGeneralCard.tsx";
 import { OrgMembersCard } from "./settings/OrgMembersCard.tsx";
@@ -90,6 +91,7 @@ type OrgSectionId =
   | "members"
   | "billing"
   | "agent-guidance"
+  | "agent-memories"
   | "weekly-digest"
   | "mgmt-keys"
   | "github-install";
@@ -108,6 +110,7 @@ const ORG_SECTIONS: ReadonlyArray<{ id: OrgSectionId; label: string }> = [
   { id: "members", label: "Members" },
   { id: "billing", label: "Billing" },
   { id: "agent-guidance", label: "Agent guidance" },
+  { id: "agent-memories", label: "Agent memories" },
   { id: "weekly-digest", label: "Weekly digest" },
   { id: "mgmt-keys", label: "Management API keys" },
   { id: "github-install", label: "GitHub install" },
@@ -675,6 +678,15 @@ function OrgSectionView({ section }: { section: OrgSectionId }) {
           subtitle="Prepended to every agent run prompt across all projects in this org."
         >
           <OrgGuidanceCard />
+        </Section>
+      );
+    case "agent-memories":
+      return (
+        <Section
+          title="Agent memories"
+          subtitle="Durable facts the investigation agent carries across runs — terminology, infra layout, lessons from your feedback. The agent saves these itself; review and prune them here."
+        >
+          <AgentMemoriesCard />
         </Section>
       );
     case "weekly-digest":
