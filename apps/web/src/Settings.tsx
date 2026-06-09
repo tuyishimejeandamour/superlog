@@ -4,6 +4,7 @@ import {
   type AgentSettings,
   type AutoMergeMethod,
   type AutoMergePolicy,
+  type CloudConnection,
   EMPTY_ISSUE_FILTER_CONFIG,
   type Integration,
   type IssueFilterClause,
@@ -15,9 +16,12 @@ import {
   type WebhookDelivery,
   type WebhookEndpoint,
   useAgentSettings,
+  useCloudConnections,
+  useCreateCloudConnection,
   useCreateKey,
   useCreateOrgProject,
   useCreateWebhook,
+  useDeleteCloudConnection,
   useDeleteOrgProject,
   useDeleteSlackRoute,
   useDeleteWebhook,
@@ -69,6 +73,7 @@ import {
   useUpdateGithubRepoAccess,
   useUpdateOrgProject,
   useUpdateWebhook,
+  useVerifyCloudConnection,
   useWebhookDeliveries,
   useWebhooks,
 } from "./api";
@@ -726,6 +731,7 @@ function ProjectSectionView({
             <GithubCard />
             <SlackCard />
             <LinearCard />
+            <AwsCard projectId={projectId} />
           </div>
         </Section>
       );
@@ -1311,11 +1317,15 @@ function SlackRoutingCard({ projectId }: { projectId: string | undefined }) {
         </div>
 
         {channels.isError ? (
-          <p className="text-[12px] text-muted">Couldn't fetch the channel list — try reconnecting Slack.</p>
+          <p className="text-[12px] text-muted">
+            Couldn't fetch the channel list — try reconnecting Slack.
+          </p>
         ) : (
           <p className="text-[12px] text-muted">
             Don't see a private channel? Slack only lists private channels the bot belongs to — run{" "}
-            <code className="rounded-sm bg-surface-2 px-1 py-0.5 text-[11px]">/invite @Superlog</code>{" "}
+            <code className="rounded-sm bg-surface-2 px-1 py-0.5 text-[11px]">
+              /invite @Superlog
+            </code>{" "}
             in that channel, then reopen this list.
           </p>
         )}
@@ -1489,6 +1499,222 @@ function LinearCard() {
             </Btn>
           )}
         </div>
+      </div>
+    </Tile>
+  );
+}
+
+function awsStatusChip(c?: CloudConnection) {
+  if (!c)
+    return (
+      <Chip tone="muted" dot>
+        Not connected
+      </Chip>
+    );
+  switch (c.status) {
+    case "connected":
+      return (
+        <Chip tone="success" dot>
+          Connected · {c.accountId} · {c.region}
+        </Chip>
+      );
+    case "pending":
+      return (
+        <Chip tone="warning" dot>
+          Awaiting stack deploy
+        </Chip>
+      );
+    case "account_mismatch":
+      return (
+        <Chip tone="danger" dot>
+          Account mismatch
+        </Chip>
+      );
+    case "failed":
+      return (
+        <Chip tone="danger" dot>
+          Verification failed
+        </Chip>
+      );
+  }
+}
+
+// Commercial AWS regions. Metric streams / Firehose are regional, so the
+// connection targets one region (multi-region = multiple connections later).
+const AWS_REGIONS: ReadonlyArray<{ code: string; name: string }> = [
+  { code: "us-east-1", name: "US East (N. Virginia)" },
+  { code: "us-east-2", name: "US East (Ohio)" },
+  { code: "us-west-1", name: "US West (N. California)" },
+  { code: "us-west-2", name: "US West (Oregon)" },
+  { code: "ca-central-1", name: "Canada (Central)" },
+  { code: "ca-west-1", name: "Canada West (Calgary)" },
+  { code: "eu-west-1", name: "Europe (Ireland)" },
+  { code: "eu-west-2", name: "Europe (London)" },
+  { code: "eu-west-3", name: "Europe (Paris)" },
+  { code: "eu-central-1", name: "Europe (Frankfurt)" },
+  { code: "eu-central-2", name: "Europe (Zurich)" },
+  { code: "eu-north-1", name: "Europe (Stockholm)" },
+  { code: "eu-south-1", name: "Europe (Milan)" },
+  { code: "eu-south-2", name: "Europe (Spain)" },
+  { code: "ap-south-1", name: "Asia Pacific (Mumbai)" },
+  { code: "ap-south-2", name: "Asia Pacific (Hyderabad)" },
+  { code: "ap-southeast-1", name: "Asia Pacific (Singapore)" },
+  { code: "ap-southeast-2", name: "Asia Pacific (Sydney)" },
+  { code: "ap-southeast-3", name: "Asia Pacific (Jakarta)" },
+  { code: "ap-southeast-4", name: "Asia Pacific (Melbourne)" },
+  { code: "ap-southeast-5", name: "Asia Pacific (Malaysia)" },
+  { code: "ap-southeast-7", name: "Asia Pacific (Thailand)" },
+  { code: "ap-northeast-1", name: "Asia Pacific (Tokyo)" },
+  { code: "ap-northeast-2", name: "Asia Pacific (Seoul)" },
+  { code: "ap-northeast-3", name: "Asia Pacific (Osaka)" },
+  { code: "ap-east-1", name: "Asia Pacific (Hong Kong)" },
+  { code: "ap-east-2", name: "Asia Pacific (Taipei)" },
+  { code: "sa-east-1", name: "South America (São Paulo)" },
+  { code: "mx-central-1", name: "Mexico (Central)" },
+  { code: "me-south-1", name: "Middle East (Bahrain)" },
+  { code: "me-central-1", name: "Middle East (UAE)" },
+  { code: "il-central-1", name: "Israel (Tel Aviv)" },
+  { code: "af-south-1", name: "Africa (Cape Town)" },
+];
+
+const AWS_REGION_OPTIONS = AWS_REGIONS.map((r) => ({
+  value: r.code,
+  label: (
+    <span>
+      <span className="font-mono">{r.code}</span>
+      <span className="text-muted"> · {r.name}</span>
+    </span>
+  ),
+  searchText: `${r.code} ${r.name}`,
+}));
+
+function AwsCard({ projectId }: { projectId: string | undefined }) {
+  const connections = useCloudConnections(projectId);
+  const create = useCreateCloudConnection(projectId ?? "");
+  const verify = useVerifyCloudConnection(projectId ?? "");
+  const del = useDeleteCloudConnection(projectId ?? "");
+
+  const [region, setRegion] = useState("us-west-2");
+  // The launch URL + external id are only returned once, at create time — keep
+  // them in memory to drive the "deploy then paste the ARN" step.
+  const [created, setCreated] = useState<{ id: string; launchUrl: string } | null>(null);
+  const [roleArn, setRoleArn] = useState("");
+
+  const list = connections.data ?? [];
+  const active = list.find((c) => c.status === "connected") ?? list[0];
+  // The connection we're mid-setup on: just created, or an existing un-verified row.
+  const setupTarget = active && active.status !== "connected" ? active : undefined;
+
+  return (
+    <Tile label="AWS">
+      <div className="space-y-3">
+        <p className="text-[13px] text-muted">
+          Connect your AWS account to inventory resources and stream CloudWatch metrics. Deploys a
+          read-only IAM role you control via CloudFormation — revoke any time.
+        </p>
+
+        <div>{awsStatusChip(active)}</div>
+
+        {active?.status === "connected" ? (
+          <div className="flex items-center gap-2">
+            <Btn
+              size="sm"
+              variant="danger"
+              loading={del.isPending}
+              onClick={() => del.mutate(active.id)}
+            >
+              Disconnect
+            </Btn>
+          </div>
+        ) : setupTarget || created ? (
+          <div className="space-y-2">
+            {created && (
+              <Btn
+                size="sm"
+                variant="primary"
+                onClick={() => window.open(created.launchUrl, "_blank", "noopener")}
+              >
+                Launch CloudFormation stack
+              </Btn>
+            )}
+            {created && (
+              <p className="text-[12px] text-muted">
+                After you create the stack it connects automatically — this updates on its own. Or
+                paste the Role ARN from the stack's Outputs below.
+              </p>
+            )}
+            <FieldLabel>Role ARN (from the stack's Outputs)</FieldLabel>
+            <Input
+              value={roleArn}
+              onChange={(e) => setRoleArn(e.target.value)}
+              placeholder="arn:aws:iam::123456789012:role/SuperlogScrapeRole"
+            />
+            {setupTarget &&
+              (setupTarget.status === "failed" || setupTarget.status === "account_mismatch") && (
+                <p className="text-[12px] text-danger">
+                  {setupTarget.lastError ??
+                    "Couldn't assume the role — confirm the stack deployed and the ARN is correct."}
+                </p>
+              )}
+            <div className="flex items-center gap-2">
+              <Btn
+                size="sm"
+                variant="primary"
+                loading={verify.isPending}
+                disabled={!roleArn.trim()}
+                onClick={async () => {
+                  const id = created?.id ?? setupTarget?.id;
+                  if (!id) return;
+                  const res = await verify.mutateAsync({
+                    id,
+                    scrapeRoleArn: roleArn.trim(),
+                  });
+                  if (res.status === "connected") {
+                    setCreated(null);
+                    setRoleArn("");
+                  }
+                }}
+              >
+                Verify connection
+              </Btn>
+              <Btn
+                size="sm"
+                variant="ghost"
+                loading={del.isPending}
+                onClick={() => {
+                  const id = created?.id ?? setupTarget?.id;
+                  setCreated(null);
+                  setRoleArn("");
+                  if (id) del.mutate(id);
+                }}
+              >
+                Cancel
+              </Btn>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <FieldLabel>Region</FieldLabel>
+            <Dropdown
+              value={region}
+              onChange={setRegion}
+              options={AWS_REGION_OPTIONS}
+              placeholder="Select a region…"
+            />
+            <Btn
+              size="sm"
+              variant="primary"
+              loading={create.isPending}
+              disabled={!projectId || !region.trim()}
+              onClick={async () => {
+                const res = await create.mutateAsync({ region: region.trim() });
+                setCreated({ id: res.id, launchUrl: res.launchUrl });
+              }}
+            >
+              Connect AWS
+            </Btn>
+          </div>
+        )}
       </div>
     </Tile>
   );

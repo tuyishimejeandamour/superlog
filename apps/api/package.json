@@ -12,7 +12,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudcontrol": "^3.1053.0",
+    "@aws-sdk/client-resource-groups-tagging-api": "^3.1053.0",
     "@aws-sdk/client-s3": "^3.1053.0",
+    "@aws-sdk/client-sts": "^3.1053.0",
     "@clickhouse/client": "^1.9.0",
     "@hono/node-server": "^1.13.7",
     "@hono/standard-validator": "^0.2.2",

@@ -30,6 +30,7 @@ import { nanoid } from "nanoid";
 import { mountAlerts } from "./alerts.js";
 import { auth } from "./auth.js";
 import { shouldRunMigrationsOnBoot } from "./boot-migrations.js";
+import { mountCloudConnectionsAuthed } from "./cloud-connections.js";
 import { mountDashboards } from "./dashboards.js";
 import { mountFeedbackAuthed, mountFeedbackPublic } from "./feedback.js";
 import { type GatewayVars, mountGateway } from "./gateway.js";
@@ -257,6 +258,9 @@ app.use("/api/*", async (c, next) => {
   if (c.req.path.startsWith("/api/v1/")) return next();
   if (c.req.path.startsWith("/api/auth/")) return next();
   if (c.req.path === "/api/auth-providers") return next();
+  // Zero-paste AWS-connect callback: no session — authenticated by the
+  // connection's external ID inside the body (see cloud-connections.ts).
+  if (c.req.path === "/api/cloud-connections/callback") return next();
   const session = await auth.api.getSession({ headers: c.req.raw.headers });
   if (!session) return c.json({ error: "unauthenticated" }, 401);
   c.set("userId", session.user.id);
@@ -275,6 +279,7 @@ mountSlackAuthed(app);
 mountSettingsAuthed(app);
 mountOrgKeyManagementAuthed(app);
 mountDashboards(app);
+mountCloudConnectionsAuthed(app);
 mountAlerts(app, { ch });
 mountWebhooks(app);
 mountFeedbackAuthed(app);

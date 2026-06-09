@@ -1624,6 +1624,101 @@ export const feedback = pgTable(
   }),
 );
 
+/**
+ * Status of a customer AWS connection. `pending` until the customer deploys the
+ * CloudFormation stack and we successfully assume the scrape role;
+ * `account_mismatch` if the assumed identity resolves to a different account than
+ * the role ARN names; `failed` if the role can't be assumed.
+ */
+export type CloudConnectionStatus =
+  | "pending"
+  | "connected"
+  | "account_mismatch"
+  | "failed";
+
+export const cloudConnections = pgTable(
+  "cloud_connections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Region the connection's CloudFormation stack lives in (metric streams /
+    // Firehose are regional). Single-region per connection for v1.
+    region: text("region").notNull(),
+    // Read-only scrape/metrics role assumed for inventory + stack provisioning.
+    // Null until the customer deploys the stack and reports the role ARN at verify
+    // (the role doesn't exist before deploy; the external ID below is minted first
+    // because it has to go *into* the stack).
+    scrapeRoleArn: text("scrape_role_arn"),
+    // The trust-policy external ID, encrypted at rest (confused-deputy guard).
+    externalIdCiphertext: bytea("external_id_ciphertext").notNull(),
+    externalIdNonce: bytea("external_id_nonce").notNull(),
+    externalIdKeyVersion: integer("external_id_key_version").notNull().default(1),
+    // Set on the first successful verify, from the assumed caller identity.
+    accountId: text("account_id"),
+    status: text("status").$type<CloudConnectionStatus>().notNull().default("pending"),
+    lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (t) => ({
+    projectIdx: index("cloud_connections_project_idx").on(t.projectId),
+    // One live connection per (project, scrape role) — re-connecting the same role
+    // revokes the old row first (see the upsert in cloud-connections.ts).
+    activeRoleUniq: uniqueIndex("cloud_connections_active_role_idx")
+      .on(t.projectId, t.scrapeRoleArn)
+      .where(sql`revoked_at IS NULL`),
+  }),
+);
+
+export const cloudResources = pgTable(
+  "cloud_resources",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Which connection discovered this resource (a project may connect several).
+    connectionId: uuid("connection_id")
+      .notNull()
+      .references(() => cloudConnections.id, { onDelete: "cascade" }),
+    arn: text("arn").notNull(),
+    // Derived from the ARN: service (e.g. "ec2"), resource type (e.g. "instance").
+    service: text("service").notNull(),
+    resourceType: text("resource_type"),
+    region: text("region"),
+    accountId: text("account_id"),
+    // Best-effort display name (the `Name` tag, else the ARN's resource id).
+    name: text("name"),
+    tags: jsonb("tags").$type<Record<string, string>>(),
+    // Raw ResourceGroupsTaggingAPI mapping, for fields we don't model yet.
+    raw: jsonb("raw"),
+    // Resource configuration from the Cloud Control API (best-effort; null for
+    // types Cloud Control doesn't support or that we don't enrich). Never holds
+    // secret values — the scrape role can't read those.
+    config: jsonb("config"),
+    configFetchedAt: timestamp("config_fetched_at", { withTimezone: true }),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).defaultNow().notNull(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).defaultNow().notNull(),
+    // Set when a sync no longer sees the resource (deleted in AWS); cleared if it
+    // reappears. Kept as a soft-delete so history/grouping survive transient drops.
+    removedAt: timestamp("removed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    projectArnUniq: uniqueIndex("cloud_resources_project_arn_idx").on(t.projectId, t.arn),
+    projectIdx: index("cloud_resources_project_idx").on(t.projectId),
+    connectionIdx: index("cloud_resources_connection_idx").on(t.connectionId),
+  }),
+);
+
 export type Org = typeof orgs.$inferSelect;
 export type User = typeof users.$inferSelect;
 export type Project = typeof projects.$inferSelect;
@@ -1664,3 +1759,5 @@ export type Account = typeof accounts.$inferSelect;
 export type Verification = typeof verifications.$inferSelect;
 export type Invitation = typeof invitations.$inferSelect;
 export type OrgMember = typeof orgMembers.$inferSelect;
+export type CloudConnection = typeof cloudConnections.$inferSelect;
+export type CloudResource = typeof cloudResources.$inferSelect;

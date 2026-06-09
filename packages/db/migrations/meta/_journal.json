@@ -428,6 +428,27 @@
       "when": 1780806493821,
       "tag": "0060_crazy_strong_guy",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1780949255600,
+      "tag": "0061_closed_mephistopheles",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1780967485455,
+      "tag": "0062_quick_dark_beast",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1780971346165,
+      "tag": "0063_thin_terrax",
+      "breakpoints": true
     }
   ]
 }

@@ -723,6 +723,116 @@ export function useDeleteSlackRoute(projectId: string) {
   });
 }
 
+export type CloudConnectionStatus = "pending" | "connected" | "account_mismatch" | "failed";
+
+export type CloudConnection = {
+  id: string;
+  projectId: string;
+  region: string;
+  scrapeRoleArn: string | null;
+  accountId: string | null;
+  status: CloudConnectionStatus;
+  lastVerifiedAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+// The create response also returns the one-time launch URL + external id.
+export type CreatedCloudConnection = CloudConnection & {
+  launchUrl: string;
+  externalId: string;
+};
+
+export function useCloudConnections(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["cloud-connections", projectId],
+    queryFn: () => fetcher<CloudConnection[]>(`/api/projects/${projectId}/cloud-connections`),
+    enabled: !!projectId,
+    // While a connection is pending, poll so zero-paste connects (the stack
+    // reports its role back via the callback) flip to Connected on their own.
+    refetchInterval: (query) => {
+      const rows = query.state.data as CloudConnection[] | undefined;
+      return rows?.some((r) => r.status === "pending") ? 4000 : false;
+    },
+  });
+}
+
+export function useCreateCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { region: string }) =>
+      fetcher<CreatedCloudConnection>(`/api/projects/${projectId}/cloud-connections`, {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-connections", projectId] }),
+  });
+}
+
+export function useVerifyCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string; scrapeRoleArn: string }) =>
+      fetcher<CloudConnection>(`/api/projects/${projectId}/cloud-connections/${input.id}/verify`, {
+        method: "POST",
+        body: JSON.stringify({ scrapeRoleArn: input.scrapeRoleArn }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-connections", projectId] }),
+  });
+}
+
+export type CloudResourceRow = {
+  id: string;
+  connectionId: string;
+  arn: string;
+  service: string;
+  resourceType: string | null;
+  region: string | null;
+  accountId: string | null;
+  name: string | null;
+  tags: Record<string, string> | null;
+  lastSeenAt: string;
+};
+
+export function useCloudResources(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["cloud-resources", projectId],
+    queryFn: () => fetcher<CloudResourceRow[]>(`/api/projects/${projectId}/cloud-resources`),
+    enabled: !!projectId,
+  });
+}
+
+// Trigger an inventory sweep for one connection; resources list invalidates after.
+export function useSyncCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: string) =>
+      fetcher<{ discovered: number; removed: number }>(
+        `/api/projects/${projectId}/cloud-connections/${connectionId}/sync`,
+        { method: "POST" },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-resources", projectId] }),
+  });
+}
+
+export function useDeleteCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetcher<{ ok: true }>(`/api/projects/${projectId}/cloud-connections/${id}`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-connections", projectId] }),
+  });
+}
+
 export type LinearInstallation =
   | { installed: false }
   | {
