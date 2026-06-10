@@ -1352,6 +1352,7 @@ app.patch("/api/projects/:projectId/incidents/:incidentId", async (c) => {
             installationId: pr.githubInstallationId,
             repoFullName: pr.repoFullName,
             prNumber: pr.prNumber,
+            prNodeId: pr.prNodeId,
           }),
       });
     }
@@ -1433,6 +1434,7 @@ async function decideResolutionProposal(
           installationId: pr.githubInstallationId,
           repoFullName: pr.repoFullName,
           prNumber: pr.prNumber,
+          prNodeId: pr.prNodeId,
         }),
     });
   }

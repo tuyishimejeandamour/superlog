@@ -696,28 +696,81 @@ export async function closeAgentPullRequestOnGithub(opts: {
   installationId: number;
   repoFullName: string;
   prNumber: number;
+  prNodeId?: string | null;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const token = await createGithubWriteToken(opts.installationId);
-    const res = await fetch(
-      `${GITHUB_API}/repos/${opts.repoFullName}/pulls/${opts.prNumber}`,
-      {
-        method: "PATCH",
-        headers: {
-          accept: "application/vnd.github+json",
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json; charset=utf-8",
-          "x-github-api-version": "2022-11-28",
-          "user-agent": "superlog-worker",
-        },
-        body: JSON.stringify({ state: "closed" }),
-      },
-    );
-    if (res.ok) return { ok: true };
-    const text = await res.text().catch(() => "");
-    return { ok: false, error: `github PATCH /pulls/${opts.prNumber} ${res.status} ${text}` };
+    return closeGithubPullRequestWithToken({
+      token,
+      repoFullName: opts.repoFullName,
+      prNumber: opts.prNumber,
+      prNodeId: opts.prNodeId,
+      userAgent: "superlog-worker",
+    });
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function closeGithubPullRequestWithToken(opts: {
+  token: string;
+  repoFullName: string;
+  prNumber: number;
+  prNodeId?: string | null;
+  userAgent: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const errors: string[] = [];
+  if (opts.prNodeId) {
+    const res = await fetchImpl(`${GITHUB_API}/graphql`, {
+      method: "POST",
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${opts.token}`,
+        "content-type": "application/json; charset=utf-8",
+        "x-github-api-version": "2022-11-28",
+        "user-agent": opts.userAgent,
+      },
+      body: JSON.stringify({
+        query: `mutation ClosePullRequest($pullRequestId: ID!) {
+          closePullRequest(input: { pullRequestId: $pullRequestId }) {
+            pullRequest { id closed }
+          }
+        }`,
+        variables: { pullRequestId: opts.prNodeId },
+      }),
+    });
+    const text = await res.text().catch(() => "");
+    if (res.ok) {
+      const data = text ? parseGithubGraphqlResponse(text) : {};
+      if (!data.errors?.length) return { ok: true };
+    }
+    errors.push(`github GraphQL closePullRequest ${res.status} ${text}`);
+  }
+
+  const res = await fetchImpl(`${GITHUB_API}/repos/${opts.repoFullName}/pulls/${opts.prNumber}`, {
+    method: "PATCH",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${opts.token}`,
+      "content-type": "application/json; charset=utf-8",
+      "x-github-api-version": "2022-11-28",
+      "user-agent": opts.userAgent,
+    },
+    body: JSON.stringify({ state: "closed" }),
+  });
+  if (res.ok) return { ok: true };
+  const text = await res.text().catch(() => "");
+  errors.push(`github PATCH /pulls/${opts.prNumber} ${res.status} ${text}`);
+  return { ok: false, error: errors.join("; ") };
+}
+
+function parseGithubGraphqlResponse(text: string): { errors?: unknown[] } {
+  try {
+    return JSON.parse(text) as { errors?: unknown[] };
+  } catch {
+    return { errors: [{ message: "invalid json response" }] };
   }
 }
 

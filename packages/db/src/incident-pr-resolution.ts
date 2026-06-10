@@ -7,6 +7,7 @@ export type IncidentOpenPullRequestToClose = {
   githubInstallationId: number;
   repoFullName: string;
   prNumber: number;
+  prNodeId: string | null;
 };
 
 export type CloseIncidentPullRequest = (
@@ -32,6 +33,7 @@ export async function closeIncidentOpenPullRequestsAfterResolution(opts: {
       id: schema.agentPullRequests.id,
       repoFullName: schema.agentPullRequests.repoFullName,
       prNumber: schema.agentPullRequests.prNumber,
+      prNodeId: schema.agentPullRequests.prNodeId,
       githubInstallationId: schema.githubInstallations.installationId,
     })
     .from(schema.agentPullRequests)

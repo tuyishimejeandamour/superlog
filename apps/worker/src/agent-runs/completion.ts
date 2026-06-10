@@ -38,6 +38,7 @@ async function closeOpenPullRequestsForResolvedIncident(incidentId: string): Pro
         installationId: pr.githubInstallationId,
         repoFullName: pr.repoFullName,
         prNumber: pr.prNumber,
+        prNodeId: pr.prNodeId,
       }),
     onCloseFailure: ({ pr, error }) =>
       logger.warn(

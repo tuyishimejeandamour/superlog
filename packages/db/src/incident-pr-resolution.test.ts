@@ -58,8 +58,20 @@ function recordingDb(rows: IncidentOpenPullRequestToClose[]): { db: DB; calls: R
 test("closeIncidentOpenPullRequestsAfterResolution closes open PRs and records events", async () => {
   const closedAt = new Date("2026-06-07T01:02:03.000Z");
   const { db, calls } = recordingDb([
-    { id: "pr-1", githubInstallationId: 101, repoFullName: "acme/api", prNumber: 12 },
-    { id: "pr-2", githubInstallationId: 202, repoFullName: "acme/web", prNumber: 34 },
+    {
+      id: "pr-1",
+      githubInstallationId: 101,
+      repoFullName: "acme/api",
+      prNumber: 12,
+      prNodeId: "PR_node_1",
+    },
+    {
+      id: "pr-2",
+      githubInstallationId: 202,
+      repoFullName: "acme/web",
+      prNumber: 34,
+      prNodeId: null,
+    },
   ]);
   const closed: string[] = [];
 
@@ -68,13 +80,13 @@ test("closeIncidentOpenPullRequestsAfterResolution closes open PRs and records e
     database: db,
     now: () => closedAt,
     closePullRequest: async (pr) => {
-      closed.push(`${pr.repoFullName}#${pr.prNumber}`);
+      closed.push(`${pr.repoFullName}#${pr.prNumber}:${pr.prNodeId ?? "no-node"}`);
       return { ok: true };
     },
   });
 
   assert.deepEqual(result, { closedPullRequestCount: 2, failedPullRequestCount: 0 });
-  assert.deepEqual(closed, ["acme/api#12", "acme/web#34"]);
+  assert.deepEqual(closed, ["acme/api#12:PR_node_1", "acme/web#34:no-node"]);
   const updates = calls.filter((call) => call.op === "update");
   assert.equal(updates.length, 2);
   assert.equal(updates[0]?.table, schema.agentPullRequests);
@@ -88,7 +100,13 @@ test("closeIncidentOpenPullRequestsAfterResolution closes open PRs and records e
 
 test("closeIncidentOpenPullRequestsAfterResolution leaves failed PRs open", async () => {
   const { db, calls } = recordingDb([
-    { id: "pr-1", githubInstallationId: 101, repoFullName: "acme/api", prNumber: 12 },
+    {
+      id: "pr-1",
+      githubInstallationId: 101,
+      repoFullName: "acme/api",
+      prNumber: 12,
+      prNodeId: "PR_node_1",
+    },
   ]);
   const failures: string[] = [];
 

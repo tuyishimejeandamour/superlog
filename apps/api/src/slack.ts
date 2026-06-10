@@ -398,6 +398,7 @@ async function runSlackResolvedIncidentSideEffects(incidentId: string): Promise<
         installationId: pr.githubInstallationId,
         repoFullName: pr.repoFullName,
         prNumber: pr.prNumber,
+        prNodeId: pr.prNodeId,
       }),
   });
 }
@@ -438,6 +439,7 @@ async function handleProposalDecision(
           installationId: pr.githubInstallationId,
           repoFullName: pr.repoFullName,
           prNumber: pr.prNumber,
+          prNodeId: pr.prNodeId,
         }),
     });
   }
