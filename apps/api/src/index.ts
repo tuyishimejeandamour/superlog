@@ -48,7 +48,10 @@ import { mountImpersonation } from "./impersonation.js";
 import { buildIncidentListItem, shouldInlineIncidentListStats } from "./incidents/list.js";
 import { getPrDeliveryRetryEligibility } from "./incidents/pr-retry.js";
 import { buildIncidentPullRequestViews } from "./incidents/pr-view.js";
-import { runResolvedIncidentSideEffectsForIncident } from "./incidents/resolution-side-effects.js";
+import {
+  runResolvedIncidentSideEffectsForIncident,
+  shouldRunResolvedIncidentSideEffects,
+} from "./incidents/resolution-side-effects.js";
 import {
   buildIncidentStatsFromActivityRows,
   buildIncidentStatsFromIssues,
@@ -1334,14 +1337,14 @@ app.patch("/api/projects/:projectId/incidents/:incidentId", async (c) => {
   if (status === "resolved") {
     // Route the dashboard's mark-resolved through the shared helper so the
     // resolved_* columns are populated exactly like every other resolve path.
-    const { resolved } = await resolveIncident({
+    await resolveIncident({
       incidentId,
       kind: "dashboard_manual",
       reasonCode: "dashboard_manual",
       reasonText: `Resolved from the dashboard by user ${c.var.userId}.`,
       resolvedByUserId: c.var.userId,
     });
-    if (resolved) {
+    if (shouldRunResolvedIncidentSideEffects({ requestedStatus: status, incidentExists: true })) {
       await runResolvedIncidentSideEffectsForIncident({
         incidentId,
         closePullRequest: (pr) =>

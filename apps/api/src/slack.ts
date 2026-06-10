@@ -365,12 +365,12 @@ async function handleSlackResolveIncident(
     // resolves. Skip the investigation event to avoid coupling to a possibly-
     // unrelated latest investigation.
   });
+  await runSlackResolvedIncidentSideEffects(incidentId);
+
   if (!resolved) {
     log.info({ incidentId }, "resolve_incident click lost race with concurrent close");
     return;
   }
-
-  await runSlackResolvedIncidentSideEffects(incidentId);
 
   const installation = await installationForIncident({
     pinnedId: incident.slackInstallationId,

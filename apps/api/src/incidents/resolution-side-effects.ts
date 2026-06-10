@@ -26,6 +26,13 @@ export type ResolvedIncidentSideEffectDeps = {
   }): Promise<void>;
 };
 
+export function shouldRunResolvedIncidentSideEffects(opts: {
+  requestedStatus: "open" | "resolved";
+  incidentExists: boolean;
+}): boolean {
+  return opts.incidentExists && opts.requestedStatus === "resolved";
+}
+
 export async function runResolvedIncidentSideEffects(opts: {
   incident: ResolvedIncidentSideEffectIncident;
   projectName: string;
