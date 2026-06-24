@@ -1,0 +1,64 @@
+name: CI
+on:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck & build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check CI workflow security
+        run: pnpm test:ci-workflows
+      - name: typecheck
+        run: pnpm typecheck
+      - name: build
+        run: pnpm build
+  tests:
+    name: Run tests
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5434/superlog
+      BETTER_AUTH_SECRET: "a-very-long-dummy-signing-secret-for-ci-testing-purposes"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: install pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Start Postgres
+        run: |
+          docker compose up -d postgres
+          until docker compose exec -T postgres pg_isready -U postgres; do
+            echo "Waiting for Postgres to be ready..."
+            sleep 1
+          done
+      - name: Run Standard Packages Tests
+        run: pnpm -r --filter '!@superlog/db' --if-present test
+      - name: Run Database Package Tests
+        run: pnpm --filter @superlog/db test

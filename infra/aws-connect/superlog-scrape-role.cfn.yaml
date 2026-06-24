@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Superlog AWS connect — read-only scrape/inventory role. Grants Superlog a
+  cross-account role it can assume to inventory your AWS resources. Trust is
+  guarded by an ExternalId (confused-deputy protection); the role is read-only.
+  This is the baseline connection — metrics streaming, logs, and the optional
+  investigation role are added by separate stacks.
+
+Parameters:
+  SuperlogAccountId:
+    Type: String
+    Description: The Superlog AWS account allowed to assume this role.
+    AllowedPattern: "^[0-9]{12}$"
+  ExternalId:
+    Type: String
+    Description: >-
+      Unique external ID Superlog presents when assuming the role. Not NoEcho on
+      purpose: the quick-create launch link drops NoEcho params, and this is a
+      confused-deputy nonce (already in the launch URL), not a password.
+    MinLength: 16
+  RoleName:
+    Type: String
+    Description: Name for the created role.
+    Default: SuperlogScrapeRole
+  ConnectionId:
+    Type: String
+    Description: Superlog connection this stack completes (used by the callback).
+    Default: ""
+  SuperlogServiceToken:
+    Type: String
+    Description: >-
+      Superlog SNS topic ARN. When set, this stack reports the new role ARN back
+      to Superlog automatically (zero-paste). Leave blank to instead copy the
+      ScrapeRoleArn output into Superlog by hand.
+    Default: ""
+
+Conditions:
+  # Auto-report only when both the SNS topic and a connection id are supplied.
+  ReportBack: !And
+    - !Not [!Equals [!Ref SuperlogServiceToken, ""]]
+    - !Not [!Equals [!Ref ConnectionId, ""]]
+
+Resources:
+  ScrapeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Read-only role Superlog assumes to inventory AWS resources.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${SuperlogAccountId}:root"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref ExternalId
+      Policies:
+        - PolicyName: SuperlogScrapeReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Resource inventory across all taggable services.
+              - Sid: ResourceInventory
+                Effect: Allow
+                Action:
+                  - "tag:GetResources"
+                  - "tag:GetTagKeys"
+                  - "tag:GetTagValues"
+                Resource: "*"
+              # Metric catalog (which metrics exist per resource) — not the
+              # datapoints, which stream in separately.
+              - Sid: MetricCatalog
+                Effect: Allow
+                Action:
+                  - "cloudwatch:ListMetrics"
+                Resource: "*"
+              # Resource configuration via the Cloud Control API. Cloud Control
+              # invokes the underlying read APIs, so we grant the curated set of
+              # describe/get-config actions for the resource types we enrich.
+              - Sid: ConfigRead
+                Effect: Allow
+                Action:
+                  # The Cloud Control API is authorized under the cloudformation:
+                  # namespace, NOT cloudcontrol: — cloudcontrol:* are not real IAM
+                  # actions.
+                  - "cloudformation:GetResource"
+                  - "cloudformation:ListResources"
+                  - "ec2:Describe*"
+                  - "rds:Describe*"
+                  - "rds:ListTagsForResource"
+                  - "lambda:GetFunction"
+                  - "lambda:GetFunctionConfiguration"
+                  - "lambda:ListFunctions"
+                  - "elasticloadbalancing:Describe*"
+                  - "ecs:Describe*"
+                  - "ecs:List*"
+                  - "autoscaling:Describe*"
+                  # The Cloud Control EC2::Instance handler reads SSM associations.
+                  - "ssm:ListAssociations"
+                  - "ssm:DescribeInstanceInformation"
+                Resource: "*"
+              # Hard stop: even with the broader read above, never allow reading
+              # secret values, decrypting, or bulk data-plane reads. Explicit Deny
+              # overrides any Allow.
+              - Sid: DenySensitiveReads
+                Effect: Deny
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                  - "kms:Decrypt"
+                  - "kms:GenerateDataKey"
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                  - "ssm:GetParametersByPath"
+                  - "s3:GetObject"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:BatchGetItem"
+                  - "dynamodb:Query"
+                  - "dynamodb:Scan"
+                Resource: "*"
+
+  # Zero-paste reporting. CloudFormation publishes this custom resource's request
+  # (including RoleArn below + a response URL) to Superlog's SNS topic; Superlog's
+  # bridge records the role ARN, verifies it, and signals success back to CFN. No
+  # Lambda or outbound internet runs in this account — only a message to an SNS
+  # topic. Skipped entirely when SuperlogServiceToken is blank (manual flow).
+  RegisterWithSuperlog:
+    Type: Custom::SuperlogConnect
+    Condition: ReportBack
+    Properties:
+      ServiceToken: !Ref SuperlogServiceToken
+      RoleArn: !GetAtt ScrapeRole.Arn
+      AccountId: !Ref "AWS::AccountId"
+      Region: !Ref "AWS::Region"
+      ConnectionId: !Ref ConnectionId
+      ExternalId: !Ref ExternalId
+
+Outputs:
+  ScrapeRoleArn:
+    Description: >-
+      The role ARN. With zero-paste enabled it's reported automatically; otherwise
+      copy this into Superlog to finish connecting.
+    Value: !GetAtt ScrapeRole.Arn

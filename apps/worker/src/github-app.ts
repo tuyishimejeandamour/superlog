@@ -210,6 +210,39 @@ export async function createGithubWriteToken(
   });
 }
 
+// Post a comment on an agent PR — used to route a continuation turn's reply
+// back to the channel it came in on (a PR comment gets a PR answer). Best-effort
+// and idempotency-free: the caller only fires this once per completed turn.
+export async function postAgentPrComment(opts: {
+  installationId: number;
+  repoFullName: string;
+  prNumber: number;
+  body: string;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const token = await createGithubWriteToken(opts.installationId);
+    const res = await fetch(
+      `${GITHUB_API}/repos/${opts.repoFullName}/issues/${opts.prNumber}/comments`,
+      {
+        method: "POST",
+        headers: {
+          accept: "application/vnd.github+json",
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json; charset=utf-8",
+          "x-github-api-version": "2022-11-28",
+          "user-agent": "superlog-worker",
+        },
+        body: JSON.stringify({ body: opts.body }),
+      },
+    );
+    if (res.ok) return { ok: true };
+    const text = await res.text().catch(() => "");
+    return { ok: false, error: `github POST issue comment ${res.status} ${text}` };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function getGithubRepoInfo(
   installationId: number,
   repoFullName: string,
@@ -544,7 +577,10 @@ export async function applyPatchAndOpenPr(opts: {
     await ensureGitOk(["config", "user.name", gitIdentity.name], { cwd: repoDir });
     await ensureGitOk(["config", "user.email", gitIdentity.email], { cwd: repoDir });
 
-    const patchPath = path.join(repoDir, "superlog.patch");
+    // Written OUTSIDE the repo checkout: an untracked patch file inside
+    // repoDir would make `git status --porcelain` non-empty even when the
+    // patch changed nothing, defeating the no-op detection below.
+    const patchPath = path.join(workdir, "superlog.patch");
     const patchBody = normalizeAgentPatch(opts.patch);
     await writeFile(patchPath, patchBody, "utf8");
     const applyArgs = ["apply", "--index", "--whitespace=nowarn", patchPath];
@@ -636,6 +672,91 @@ export async function applyPatchAndOpenPr(opts: {
   }
 }
 
+// Follow-up delivery: apply a new patch as an additional commit on an
+// EXISTING agent PR branch (no new branch, no new PR) and reply on the PR.
+// The patch is expected to be based on the PR branch head — the follow-up
+// prompt instructs the agent to work on that branch. A non-fast-forward
+// push (someone pushed to the branch meanwhile) throws; the caller fails
+// the run rather than guessing at a merge.
+export async function pushPatchToExistingAgentPr(opts: {
+  installationId: number;
+  repositoryId?: number;
+  repoFullName: string;
+  patch: string;
+  branchName: string;
+  prNumber: number;
+  commitTitle: string;
+  commentBody: string | null;
+  commitAuthor?: { name: string; email: string } | null;
+}): Promise<{ headSha: string }> {
+  const workdir = await mkdtemp(path.join(os.tmpdir(), "superlog-pr-update-"));
+  const writeToken = await createGithubWriteToken(opts.installationId, opts.repositoryId);
+  const gitAuthEnv = githubGitAuthEnv(writeToken);
+  const repoDir = path.join(workdir, "repo");
+
+  try {
+    await ensureGitOk(
+      [
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        opts.branchName,
+        `https://github.com/${opts.repoFullName}.git`,
+        repoDir,
+      ],
+      { env: gitAuthEnv, suppressOutputOnError: true },
+    );
+    const gitIdentity = resolveGitIdentity(opts.commitAuthor);
+    await ensureGitOk(["config", "user.name", gitIdentity.name], { cwd: repoDir });
+    await ensureGitOk(["config", "user.email", gitIdentity.email], { cwd: repoDir });
+
+    // Written OUTSIDE the repo checkout: an untracked patch file inside
+    // repoDir would make `git status --porcelain` non-empty even when the
+    // patch changed nothing, defeating the no-op detection below.
+    const patchPath = path.join(workdir, "superlog.patch");
+    const patchBody = normalizeAgentPatch(opts.patch);
+    await writeFile(patchPath, patchBody, "utf8");
+    const applyArgs = ["apply", "--index", "--whitespace=nowarn", patchPath];
+    const applyResult = await runGit(applyArgs, { cwd: repoDir });
+    if (applyResult.code !== 0) {
+      throw gitApplyError(applyArgs, applyResult, patchBody);
+    }
+    const status = await ensureGitOk(["status", "--porcelain"], { cwd: repoDir });
+    if (!status.stdout.trim()) {
+      throw new Error("patch produced no working tree changes");
+    }
+    await ensureGitOk(["commit", "--no-verify", "-m", opts.commitTitle], { cwd: repoDir });
+    await ensureGitPushOk(["push", "origin", `HEAD:refs/heads/${opts.branchName}`], {
+      cwd: repoDir,
+      env: gitAuthEnv,
+      suppressOutputOnError: true,
+    });
+    const headSha = (await ensureGitOk(["rev-parse", "HEAD"], { cwd: repoDir })).stdout.trim();
+
+    if (opts.commentBody) {
+      // Best-effort: the push already landed; a failed comment shouldn't
+      // unwind the delivery.
+      try {
+        await githubRequest(`/repos/${opts.repoFullName}/issues/${opts.prNumber}/comments`, {
+          method: "POST",
+          bearerToken: writeToken,
+          body: { body: opts.commentBody },
+        });
+      } catch (err) {
+        logger.warn(
+          { scope: "github-app", err, pr_number: opts.prNumber, repo: opts.repoFullName },
+          "follow-up PR comment failed",
+        );
+      }
+    }
+
+    return { headSha };
+  } finally {
+    await rm(workdir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 // Footer appended to every agent-opened PR description so customers can
 // leave feedback in one click. Must contain the marker
 // `/feedback/pr/` because the github webhook handler filters its own
@@ -694,31 +815,100 @@ export async function getObsPrMerged(
 
 export async function closeAgentPullRequestOnGithub(opts: {
   installationId: number;
+  fallbackInstallationIds?: number[];
   repoFullName: string;
   prNumber: number;
+  prNodeId?: string | null;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
-  try {
-    const token = await createGithubWriteToken(opts.installationId);
-    const res = await fetch(
-      `${GITHUB_API}/repos/${opts.repoFullName}/pulls/${opts.prNumber}`,
-      {
-        method: "PATCH",
-        headers: {
-          accept: "application/vnd.github+json",
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json; charset=utf-8",
-          "x-github-api-version": "2022-11-28",
-          "user-agent": "superlog-worker",
-        },
-        body: JSON.stringify({ state: "closed" }),
-      },
-    );
-    if (res.ok) return { ok: true };
-    const text = await res.text().catch(() => "");
-    return { ok: false, error: `github PATCH /pulls/${opts.prNumber} ${res.status} ${text}` };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  const errors: string[] = [];
+  for (const installationId of dedupeInstallationIds([
+    opts.installationId,
+    ...(opts.fallbackInstallationIds ?? []),
+  ])) {
+    try {
+      const token = await createGithubWriteToken(installationId);
+      const result = await closeGithubPullRequestWithToken({
+        token,
+        repoFullName: opts.repoFullName,
+        prNumber: opts.prNumber,
+        prNodeId: opts.prNodeId,
+        userAgent: "superlog-worker",
+      });
+      if (result.ok) return result;
+      errors.push(`installation ${installationId}: ${result.error}`);
+    } catch (err) {
+      errors.push(
+        `installation ${installationId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
+  return { ok: false, error: errors.join("; ") || "no github installations available" };
+}
+
+async function closeGithubPullRequestWithToken(opts: {
+  token: string;
+  repoFullName: string;
+  prNumber: number;
+  prNodeId?: string | null;
+  userAgent: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const errors: string[] = [];
+  if (opts.prNodeId) {
+    const res = await fetchImpl(`${GITHUB_API}/graphql`, {
+      method: "POST",
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${opts.token}`,
+        "content-type": "application/json; charset=utf-8",
+        "x-github-api-version": "2022-11-28",
+        "user-agent": opts.userAgent,
+      },
+      body: JSON.stringify({
+        query: `mutation ClosePullRequest($pullRequestId: ID!) {
+          closePullRequest(input: { pullRequestId: $pullRequestId }) {
+            pullRequest { id closed }
+          }
+        }`,
+        variables: { pullRequestId: opts.prNodeId },
+      }),
+    });
+    const text = await res.text().catch(() => "");
+    if (res.ok) {
+      const data = text ? parseGithubGraphqlResponse(text) : {};
+      if (!data.errors?.length) return { ok: true };
+    }
+    errors.push(`github GraphQL closePullRequest ${res.status} ${text}`);
+  }
+
+  const res = await fetchImpl(`${GITHUB_API}/repos/${opts.repoFullName}/pulls/${opts.prNumber}`, {
+    method: "PATCH",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${opts.token}`,
+      "content-type": "application/json; charset=utf-8",
+      "x-github-api-version": "2022-11-28",
+      "user-agent": opts.userAgent,
+    },
+    body: JSON.stringify({ state: "closed" }),
+  });
+  if (res.ok) return { ok: true };
+  const text = await res.text().catch(() => "");
+  errors.push(`github PATCH /pulls/${opts.prNumber} ${res.status} ${text}`);
+  return { ok: false, error: errors.join("; ") };
+}
+
+function parseGithubGraphqlResponse(text: string): { errors?: unknown[] } {
+  try {
+    return JSON.parse(text) as { errors?: unknown[] };
+  } catch {
+    return { errors: [{ message: "invalid json response" }] };
+  }
+}
+
+function dedupeInstallationIds(values: number[]): number[] {
+  return [...new Set(values)];
 }
 
 export type AutoMergeMethod = "squash" | "merge" | "rebase";

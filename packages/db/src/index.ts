@@ -4,6 +4,7 @@ export {
   AGENT_RUN_PROVIDERS,
   DEFAULT_AGENT_RUN_PROVIDER,
   isAgentRunProvider,
+  resolveDefaultAgentRunProvider,
   type AgentRunProvider,
 } from "./agent-runtime.js";
 export { runMigrations } from "./migrate.js";
@@ -14,14 +15,26 @@ export {
   generateMcpAccessToken,
   generateMcpRefreshToken,
   generateOrgManagementKey,
+  generatePersonalAccessToken,
   hashApiKey,
   hashCliSession,
   hashToken,
   isCliSessionToken,
   isIngestApiKey,
   isOrgManagementKey,
+  isPersonalAccessToken,
+  PERSONAL_ACCESS_TOKEN_PREFIX,
 } from "./keys.js";
 export { mintApiKey, type MintedApiKey } from "./api-keys.js";
+export {
+  isPatExpiryChoice,
+  mintPersonalAccessToken,
+  type MintedPersonalAccessToken,
+  type PatExpiryChoice,
+  resolvePatExpiry,
+  resolvePersonalAccessToken,
+  touchPersonalAccessToken,
+} from "./personal-access-tokens.js";
 export {
   mintOrgApiKey,
   resolveOrgApiKey,
@@ -60,6 +73,13 @@ export type {
   IntegrationOperation,
   IntegrationSecretSpec,
   AgentRun,
+  AgentMemory,
+  AgentMemoryKind,
+  AgentMemoryStatus,
+  NewAgentMemory,
+  AgentRunTrigger,
+  AgentRunFollowUpInteraction,
+  AgentRunTriggerDetail,
   AgentRunResult,
   AgentRunPr,
   AgentRunLinearTicket,
@@ -104,6 +124,20 @@ export {
 } from "./webhooks.js";
 export { generateCodename } from "./codename.js";
 export {
+  evaluateFollowUpEligibility,
+  decideInboundContinuation,
+  recordInboundInteraction,
+  requestFollowUpAgentRun,
+  FOLLOW_UP_MAX_AGE_DAYS,
+  MAX_FOLLOW_UP_RUNS,
+  type FollowUpEligibilityInput,
+  type FollowUpVerdict,
+  type InboundContinuationInput,
+  type InboundContinuationVerdict,
+  type RecordInboundInteractionResult,
+  type RequestFollowUpResult,
+} from "./agent-follow-up.js";
+export {
   isActiveIncidentState,
   buildAgentRunIncidentPatch,
   buildManualReopenPatch,
@@ -135,6 +169,7 @@ export {
   type CloseIncidentPullRequest,
   type IncidentOpenPullRequestToClose,
 } from "./incident-pr-resolution.js";
+export { resolveIncidentOrg } from "./incident-org.js";
 export {
   encryptIntegrationSecret,
   decryptIntegrationSecret,
