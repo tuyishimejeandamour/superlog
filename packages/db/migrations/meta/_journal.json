@@ -428,6 +428,90 @@
       "when": 1780806493821,
       "tag": "0060_crazy_strong_guy",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1780949255600,
+      "tag": "0061_closed_mephistopheles",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1780967485455,
+      "tag": "0062_quick_dark_beast",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1780971346165,
+      "tag": "0063_thin_terrax",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1781054158707,
+      "tag": "0064_skinny_strong_guy",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1781054170075,
+      "tag": "0065_nice_ken_ellis",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1781055868470,
+      "tag": "0066_youthful_smasher",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1781579733172,
+      "tag": "0067_demonic_mac_gargan",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1781581779611,
+      "tag": "0068_sudden_the_renegades",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1781842408870,
+      "tag": "0069_brief_hellfire_club",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1781908300637,
+      "tag": "0070_oval_gertrude_yorkes",
+      "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "7",
+      "when": 1781912549129,
+      "tag": "0071_good_roxanne_simpson",
+      "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1782302382240,
+      "tag": "0072_loving_magdalene",
+      "breakpoints": true
     }
   ]
 }

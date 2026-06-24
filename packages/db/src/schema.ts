@@ -6,12 +6,14 @@ import {
   check,
   customType,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
   pgTable,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
@@ -160,6 +162,32 @@ export type AgentRunConfidence = {
   confidence: number;
 };
 
+// "issue_joined" is a machine-originated follow-up: a new error signature joined
+// an already-investigated incident. Instead of starting a fresh investigation
+// (which produced duplicate PRs for the same root cause), it steers the existing
+// investigation — same continuation path as the human channels below.
+export type AgentRunTrigger =
+  | "incident"
+  | "pr_comment"
+  | "feedback"
+  | "slack_reply"
+  | "issue_joined";
+
+export type AgentRunFollowUpInteraction = {
+  channel: Exclude<AgentRunTrigger, "incident">;
+  author: string | null;
+  text: string;
+  // PR comments: the comment URL and, for review comments, the file/line.
+  url?: string | null;
+  path?: string | null;
+  line?: number | null;
+  occurredAt: string;
+};
+
+export type AgentRunTriggerDetail = {
+  interactions: AgentRunFollowUpInteraction[];
+};
+
 export type AgentRunResult = {
   state: "complete" | "awaiting_human" | "failed";
   summary: string;
@@ -173,6 +201,10 @@ export type AgentRunResult = {
   rootCause?: AgentRunConfidence | null;
   estimatedImpact?: AgentRunConfidence | null;
   severity?: IncidentSeverity | null;
+  // Self-authored handover note for future follow-up runs on this incident:
+  // files/areas examined, hypotheses ruled out and why, repo gotchas. Written
+  // at completion when the agent still has full context.
+  handoffNotes?: string | null;
   mobileRegressionTest?: AgentRunMobileRegressionTest | null;
   noiseClassification?: IncidentNoiseClassification | null;
   resolutionClassification?: IncidentResolutionClassification | null;
@@ -219,7 +251,24 @@ export const users = pgTable("users", {
   banExpires: timestamp("ban_expires", { withTimezone: true }),
   // Legacy Clerk identity, kept during cutover for export/lookup. Drop in Phase F.
   clerkId: text("clerk_id").unique(),
+  // Last-used project, persisted across sessions. Seeded to the favorite at
+  // session start (auth.ts) and overwritten whenever the user switches project.
   activeProjectId: uuid("active_project_id").references(() => projects.id, {
+    onDelete: "set null",
+  }),
+  // Last-used org, persisted across sessions. The active org otherwise lives on
+  // the session row (Better Auth); this mirrors it so a fresh login can reopen
+  // the org the user last worked in instead of resetting to their first one.
+  activeOrgId: uuid("active_org_id").references(() => orgs.id, {
+    onDelete: "set null",
+  }),
+  // Pinned "favorite" org + project. When set, a fresh session opens these
+  // regardless of what was last used. favoriteProjectId always belongs to
+  // favoriteOrgId (enforced when set via PUT /api/me/favorite).
+  favoriteOrgId: uuid("favorite_org_id").references(() => orgs.id, {
+    onDelete: "set null",
+  }),
+  favoriteProjectId: uuid("favorite_project_id").references(() => projects.id, {
     onDelete: "set null",
   }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
@@ -359,6 +408,9 @@ export const projects = pgTable(
   },
   (t) => ({
     uniq: uniqueIndex("projects_org_slug_idx").on(t.orgId, t.slug),
+    // Lets child tables carry (project_id, org_id) composite FKs that
+    // guarantee the project belongs to the same org as the row.
+    idOrgUniq: unique("projects_id_org_uniq").on(t.id, t.orgId),
   }),
 );
 
@@ -666,6 +718,10 @@ export const projectAutomationSettings = pgTable(
     maxHumanResumeCount: integer("max_human_resume_count").notNull().default(3),
     customInstructions: text("custom_instructions").notNull().default(""),
     agentRunEnabled: boolean("agent_run_enabled").notNull().default(true),
+    // Gate for follow-up runs auto-triggered by PR comments and Slack
+    // replies after a prior run completed (feedback-triggered follow-ups
+    // are always confirm-gated regardless).
+    autoFollowUpEnabled: boolean("auto_follow_up_enabled").notNull().default(true),
     linearTicketPolicy: text("linear_ticket_policy")
       .$type<"never" | "on_ready_to_pr" | "always">()
       .notNull()
@@ -715,6 +771,14 @@ export const agentRuns = pgTable(
       .references(() => incidents.id, { onDelete: "cascade" }),
     runtime: text("runtime").notNull().default(DEFAULT_AGENT_RUN_PROVIDER),
     state: text("state").notNull().default("queued"),
+    // What started this run. "incident" is the normal investigation kicked
+    // off when the incident opens; the rest are follow-up runs revived by a
+    // human interaction after a prior run finished.
+    trigger: text("trigger").$type<AgentRunTrigger>().notNull().default("incident"),
+    // For follow-up runs: the interaction(s) that triggered it. Multiple
+    // interactions accumulate while the run is still queued (e.g. a PR
+    // review burst becomes one run, not one per comment).
+    triggerDetail: jsonb("trigger_detail").$type<AgentRunTriggerDetail>(),
     providerSessionId: text("provider_session_id"),
     providerThreadId: text("provider_thread_id"),
     providerSessionStatus: text("provider_session_status"),
@@ -1016,6 +1080,37 @@ export const cliSessions = pgTable("cli_sessions", {
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
 });
+
+// User-scoped personal access tokens. An alternative to the interactive OAuth
+// flow for authenticating to the MCP server: the user mints one in the UI and
+// pastes it into their agent as a static `Authorization: Bearer superlog_pat_…`
+// header. Bound to a single project (the MCP session's active-project default)
+// and to the minting user; `expires_at` NULL means it never expires.
+export const personalAccessTokens = pgTable(
+  "personal_access_tokens",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    tokenPrefix: text("token_prefix").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),
+    scope: text("scope"),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    userIdx: index("personal_access_tokens_user_idx").on(t.userId),
+    // Supports the project_id FK (cascade on project delete) + project-scoped lookups.
+    projectIdx: index("personal_access_tokens_project_idx").on(t.projectId),
+  }),
+);
 
 export const mcpOauthClients = pgTable("mcp_oauth_clients", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -1343,6 +1438,58 @@ export const orgAgentSettings = pgTable(
   }),
 );
 
+export type AgentMemoryKind = "feedback" | "terminology" | "infra" | "project";
+export type AgentMemoryStatus = "active" | "archived";
+
+// Durable facts the investigation agent carries across runs: terminology,
+// infra/project structure, and lessons from user feedback or conversations.
+// Memories are strictly project-scoped — each project's investigations see
+// only that project's memories. Active ones are injected into every run's
+// initial prompt; the agent writes new ones via the save_memory /
+// update_memory tools, and users manage them from project settings.
+export const agentMemories = pgTable(
+  "agent_memories",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    orgId: uuid("org_id")
+      .notNull()
+      .references(() => orgs.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    kind: text("kind").$type<AgentMemoryKind>().notNull().default("project"),
+    title: text("title").notNull(),
+    body: text("body").notNull(),
+    status: text("status").$type<AgentMemoryStatus>().notNull().default("active"),
+    // Provenance: exactly one of these is set for agent- vs user-authored
+    // memories; both stay null only for system backfills.
+    sourceAgentRunId: uuid("source_agent_run_id").references(() => agentRuns.id, {
+      onDelete: "set null",
+    }),
+    sourceUserId: uuid("source_user_id").references(() => users.id, { onDelete: "set null" }),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    orgStatusIdx: index("agent_memories_org_status_idx").on(t.orgId, t.status),
+    // The project must belong to the same org. Backed by the
+    // projects_id_org_uniq constraint on projects (added in its own earlier
+    // migration — this FK depends on it).
+    projectOrgFk: foreignKey({
+      name: "agent_memories_project_org_fk",
+      columns: [t.projectId, t.orgId],
+      foreignColumns: [projects.id, projects.orgId],
+    }).onDelete("cascade"),
+    // At most one author: agent-run provenance or user provenance, never both.
+    // Both may be null — ON DELETE SET NULL on either source requires it.
+    singleSourceCheck: check(
+      "agent_memories_single_source_check",
+      sql`NOT (source_agent_run_id IS NOT NULL AND source_user_id IS NOT NULL)`,
+    ),
+  }),
+);
+
 export type LinearTicketPolicy = "never" | "on_ready_to_pr" | "always";
 export type PrPolicy = "never" | "on_ready_to_pr" | "always";
 export type AutoMergePolicy = "never" | "when_checks_pass" | "immediately";
@@ -1624,6 +1771,190 @@ export const feedback = pgTable(
   }),
 );
 
+/**
+ * Status of a customer AWS connection. `pending` until the customer deploys the
+ * CloudFormation stack and we successfully assume the scrape role;
+ * `account_mismatch` if the assumed identity resolves to a different account than
+ * the role ARN names; `failed` if the role can't be assumed.
+ */
+export type CloudConnectionStatus = "pending" | "connected" | "account_mismatch" | "failed";
+
+export const cloudConnections = pgTable(
+  "cloud_connections",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Region the connection's CloudFormation stack lives in (metric streams /
+    // Firehose are regional). Single-region per connection for v1.
+    region: text("region").notNull(),
+    // Read-only scrape/metrics role assumed for inventory + stack provisioning.
+    // Null until the customer deploys the stack and reports the role ARN at verify
+    // (the role doesn't exist before deploy; the external ID below is minted first
+    // because it has to go *into* the stack).
+    scrapeRoleArn: text("scrape_role_arn"),
+    // The trust-policy external ID, encrypted at rest (confused-deputy guard).
+    externalIdCiphertext: bytea("external_id_ciphertext").notNull(),
+    externalIdNonce: bytea("external_id_nonce").notNull(),
+    externalIdKeyVersion: integer("external_id_key_version").notNull().default(1),
+    // Set on the first successful verify, from the assumed caller identity.
+    accountId: text("account_id"),
+    status: text("status").$type<CloudConnectionStatus>().notNull().default("pending"),
+    lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (t) => ({
+    projectIdx: index("cloud_connections_project_idx").on(t.projectId),
+    // One live connection per (project, scrape role) — re-connecting the same role
+    // revokes the old row first (see the upsert in cloud-connections.ts).
+    activeRoleUniq: uniqueIndex("cloud_connections_active_role_idx")
+      .on(t.projectId, t.scrapeRoleArn)
+      .where(sql`revoked_at IS NULL`),
+  }),
+);
+
+export const cloudResources = pgTable(
+  "cloud_resources",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Which connection discovered this resource (a project may connect several).
+    connectionId: uuid("connection_id")
+      .notNull()
+      .references(() => cloudConnections.id, { onDelete: "cascade" }),
+    arn: text("arn").notNull(),
+    // Derived from the ARN: service (e.g. "ec2"), resource type (e.g. "instance").
+    service: text("service").notNull(),
+    resourceType: text("resource_type"),
+    region: text("region"),
+    accountId: text("account_id"),
+    // Best-effort display name (the `Name` tag, else the ARN's resource id).
+    name: text("name"),
+    tags: jsonb("tags").$type<Record<string, string>>(),
+    // Raw ResourceGroupsTaggingAPI mapping, for fields we don't model yet.
+    raw: jsonb("raw"),
+    // Resource configuration from the Cloud Control API (best-effort; null for
+    // types Cloud Control doesn't support or that we don't enrich). Never holds
+    // secret values — the scrape role can't read those.
+    config: jsonb("config"),
+    configFetchedAt: timestamp("config_fetched_at", { withTimezone: true }),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).defaultNow().notNull(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).defaultNow().notNull(),
+    // Set when a sync no longer sees the resource (deleted in AWS); cleared if it
+    // reappears. Kept as a soft-delete so history/grouping survive transient drops.
+    removedAt: timestamp("removed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    projectArnUniq: uniqueIndex("cloud_resources_project_arn_idx").on(t.projectId, t.arn),
+    projectIdx: index("cloud_resources_project_idx").on(t.projectId),
+    connectionIdx: index("cloud_resources_connection_idx").on(t.connectionId),
+  }),
+);
+
+// The dedicated ingest key minted for a connection's metric/log stream, stored
+// encrypted so re-launching ("repair") reuses the *same* key instead of minting
+// a new one each time — the idempotency the reconciliation UI relies on. One row
+// per (connection, kind); the matching api_keys row carries last_used_at, which
+// is the "records actually arriving" signal.
+export const cloudStreamKeys = pgTable(
+  "cloud_stream_keys",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    connectionId: uuid("connection_id")
+      .notNull()
+      .references(() => cloudConnections.id, { onDelete: "cascade" }),
+    // "metrics" (CloudWatch Metric Streams) or "logs" (account-level subscription).
+    kind: text("kind").$type<"metrics" | "logs">().notNull(),
+    // The minted ingest key this stream authenticates with.
+    apiKeyId: uuid("api_key_id")
+      .notNull()
+      .references(() => apiKeys.id, { onDelete: "cascade" }),
+    // The key's plaintext, encrypted at rest (same scheme as the external ID), so
+    // the launch URL can re-embed it on repair without re-minting.
+    keyCiphertext: bytea("key_ciphertext").notNull(),
+    keyNonce: bytea("key_nonce").notNull(),
+    keyKeyVersion: integer("key_key_version").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    connectionKindUniq: uniqueIndex("cloud_stream_keys_connection_kind_idx").on(
+      t.connectionId,
+      t.kind,
+    ),
+  }),
+);
+
+export type CloudStreamKey = typeof cloudStreamKeys.$inferSelect;
+
+// Per-project ingest source filters. A row means the given (source, signal) is
+// DISABLED for the project — the proxy ack-drops that telemetry at the edge.
+// Sparse by design: no row = enabled, so a new project ingests everything.
+//   source: "otlp" (SDK/OTLP exporters) | "aws" (CloudWatch → Firehose)
+//   signal: "traces" | "logs" | "metrics"  (aws carries only logs/metrics)
+export const projectIngestFilters = pgTable(
+  "project_ingest_filters",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    source: text("source").$type<"otlp" | "aws">().notNull(),
+    signal: text("signal").$type<"traces" | "logs" | "metrics">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    projectSourceSignalUniq: uniqueIndex("project_ingest_filters_project_source_signal_idx").on(
+      t.projectId,
+      t.source,
+      t.signal,
+    ),
+  }),
+);
+
+export type ProjectIngestFilter = typeof projectIngestFilters.$inferSelect;
+
+// The generated service map for a project. One row per project. `graph` is the
+// deterministic topology (AWS inventory + observed telemetry edges); `enrichment`
+// is the LLM's reviewable grouping/relabel/suggested-links pass on top. The whole
+// map is regenerated wholesale by a worker job, so it's stored as JSON blobs
+// rather than normalized node/edge tables. `refreshRequestedAt > generatedAt`
+// (or a null graph) is the worker's "(re)build me" signal.
+export const projectTopologies = pgTable(
+  "project_topologies",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    // Deterministic Topology { nodes, edges, groups } from @superlog/topology.
+    graph: jsonb("graph"),
+    // TopologyEnrichment { groups, nodePatches, suggestedEdges } from the LLM pass.
+    enrichment: jsonb("enrichment"),
+    status: text("status").$type<"idle" | "generating" | "error">().default("idle").notNull(),
+    error: text("error"),
+    generatedAt: timestamp("generated_at", { withTimezone: true }),
+    refreshRequestedAt: timestamp("refresh_requested_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    projectUniq: uniqueIndex("project_topologies_project_idx").on(t.projectId),
+  }),
+);
+
+export type ProjectTopology = typeof projectTopologies.$inferSelect;
 export type Org = typeof orgs.$inferSelect;
 export type User = typeof users.$inferSelect;
 export type Project = typeof projects.$inferSelect;
@@ -1640,6 +1971,7 @@ export type CliSession = typeof cliSessions.$inferSelect;
 export type McpOauthClient = typeof mcpOauthClients.$inferSelect;
 export type McpOauthCode = typeof mcpOauthCodes.$inferSelect;
 export type McpOauthToken = typeof mcpOauthTokens.$inferSelect;
+export type PersonalAccessToken = typeof personalAccessTokens.$inferSelect;
 export type SlackInstallation = typeof slackInstallations.$inferSelect;
 export type Dashboard = typeof dashboards.$inferSelect;
 export type DashboardWidget = typeof dashboardWidgets.$inferSelect;
@@ -1647,6 +1979,8 @@ export type GithubInstallation = typeof githubInstallations.$inferSelect;
 export type ProjectGithubRepo = typeof projectGithubRepos.$inferSelect;
 export type LinearInstallation = typeof linearInstallations.$inferSelect;
 export type OrgAgentSettings = typeof orgAgentSettings.$inferSelect;
+export type AgentMemory = typeof agentMemories.$inferSelect;
+export type NewAgentMemory = typeof agentMemories.$inferInsert;
 export type OrgIntegration = typeof orgIntegrations.$inferSelect;
 export type OrgIntegrationSecret = typeof orgIntegrationSecrets.$inferSelect;
 export type SourceMapArtifact = typeof sourceMapArtifacts.$inferSelect;
@@ -1664,3 +1998,5 @@ export type Account = typeof accounts.$inferSelect;
 export type Verification = typeof verifications.$inferSelect;
 export type Invitation = typeof invitations.$inferSelect;
 export type OrgMember = typeof orgMembers.$inferSelect;
+export type CloudConnection = typeof cloudConnections.$inferSelect;
+export type CloudResource = typeof cloudResources.$inferSelect;

@@ -10,8 +10,21 @@ import type { Context } from "hono";
 import { cors } from "hono/cors";
 import { createIngestEntitlementGate, signalForPath } from "./billing/ingest-entitlement.js";
 import { EmptyBodyError, PayloadTooLargeError } from "./body-capture.js";
+import {
+  FIREHOSE_ACCESS_KEY_HEADER,
+  FIREHOSE_REQUEST_ID_HEADER,
+  FIREHOSE_SOURCE_ARN_HEADER,
+  buildFirehoseUpstreamHeaders,
+  firehoseResponseBody,
+  parseAccountIdFromFirehoseArn,
+} from "./firehose.js";
 import { stampIssueFingerprintsFailOpen } from "./ingest-fingerprints.js";
 import { IngestQueue, getIngestQueueConfig } from "./ingest-queue.js";
+import {
+  type TelemetrySignal,
+  createIngestSourceFilter,
+  ingestFilterKey,
+} from "./ingest-source-filter.js";
 import { logger } from "./logger.js";
 import { proxyOperationalRecorder } from "./operational-metrics.js";
 import { Semaphore } from "./semaphore.js";
@@ -24,6 +37,15 @@ type Variables = { projectId: string };
 const app = new Hono<{ Variables: Variables }>();
 
 const COLLECTOR_URL = process.env.COLLECTOR_URL ?? "http://localhost:4318";
+// The collector's `awsfirehose` receivers listen on their own ports — one per
+// encoding, since a receiver decodes a single format: otlp_v1 for CloudWatch
+// Metric Streams, cwlogs for the account-level Logs subscription filter.
+// Defaults target the local stack; prod points these at the collector's
+// internal endpoint.
+const FIREHOSE_METRICS_COLLECTOR_URL =
+  process.env.FIREHOSE_METRICS_COLLECTOR_URL ?? "http://localhost:4433";
+const FIREHOSE_LOGS_COLLECTOR_URL =
+  process.env.FIREHOSE_LOGS_COLLECTOR_URL ?? "http://localhost:4434";
 const PORT = Number(process.env.PORT ?? 4000);
 const ingestQueueConfig = getIngestQueueConfig(process.env);
 const ingestQueue = ingestQueueConfig ? new IngestQueue(ingestQueueConfig, logger) : null;
@@ -31,6 +53,27 @@ const ingestQueue = ingestQueueConfig ? new IngestQueue(ingestQueueConfig, logge
 // verdict is a cached, fail-open in-memory read — never a blocking call on the
 // ingest hot path (see billing/ingest-entitlement.ts).
 const ingestGate = createIngestEntitlementGate({ lookupOrgForProject });
+
+// Per-project ingest source filters (OTLP vs AWS, per signal). Cached + fail-open
+// in-memory read, same as the entitlement gate — a project's toggle ack-drops the
+// disabled telemetry at the edge. Always on; the empty default ingests everything.
+const ingestSourceFilter = createIngestSourceFilter({
+  loadDisabled: async (projectId) => {
+    const rows = await db.query.projectIngestFilters.findMany({
+      where: eq(schema.projectIngestFilters.projectId, projectId),
+      columns: { source: true, signal: true },
+    });
+    return new Set(rows.map((r) => ingestFilterKey(r.source, r.signal)));
+  },
+});
+
+// Map an OTLP ingest path to its telemetry signal for the source filter.
+function otlpSignalForPath(path: string): TelemetrySignal | null {
+  if (path === "/v1/traces") return "traces";
+  if (path === "/v1/logs") return "logs";
+  if (path === "/v1/metrics") return "metrics";
+  return null;
+}
 
 // Bound how many ingest requests buffer/stream their bodies at once. Together
 // with the per-request body cap (INGEST_MAX_BODY_BYTES) and S3 streaming for
@@ -139,6 +182,15 @@ app.post("/v1/traces", (c) => forward(c, "/v1/traces", "resourceSpans"));
 app.post("/v1/logs", (c) => forward(c, "/v1/logs", "resourceLogs"));
 app.post("/v1/metrics", (c) => forward(c, "/v1/metrics", "resourceMetrics"));
 
+// AWS Data Firehose HTTP-endpoint ingest (CloudWatch Metric Streams + Logs).
+// Firehose authenticates with X-Amz-Firehose-Access-Key (the project's ingest
+// key) rather than the x-api-key/Bearer header the /v1/* OTLP middleware reads,
+// so these routes resolve the tenant themselves. See forwardFirehose.
+app.post("/aws/firehose/metrics", (c) =>
+  forwardFirehose(c, FIREHOSE_METRICS_COLLECTOR_URL, "metrics"),
+);
+app.post("/aws/firehose/logs", (c) => forwardFirehose(c, FIREHOSE_LOGS_COLLECTOR_URL, "logs"));
+
 app.get("/health", (c) => c.json({ ok: true }));
 
 function readNonNegativeIntEnv(value: string | undefined, fallback: number): number {
@@ -241,6 +293,24 @@ async function forward(c: Context<{ Variables: Variables }>, path: string, rootK
     await requestSemaphore.acquire();
 
     try {
+      // Per-project source filter FIRST: if the project turned off its OTLP
+      // source for this signal, ack-drop with a 200 (the drop is the user's
+      // intent). This precedes the quota gate so a disabled source is always a
+      // clean 200, never a 402 the exporter would retry against.
+      const otlpSignal = otlpSignalForPath(path);
+      if (otlpSignal && !ingestSourceFilter.allows(projectId, "otlp", otlpSignal)) {
+        responseStatus = 200;
+        span.setAttribute("ingest.dropped", "source_filtered");
+        logger.info(
+          { path, projectId, signal: otlpSignal },
+          "dropping OTLP ingest; source disabled",
+        );
+        return new Response(new Uint8Array(0), {
+          status: 200,
+          headers: { "content-type": "application/x-protobuf" },
+        });
+      }
+
       // Free-tier hard-block: if the org has exhausted its monthly allowance for
       // this signal, drop with a non-retryable 4xx (402) so OTLP exporters stop
       // sending rather than retry-storm. Cached + fail-open, so this is a cheap
@@ -251,7 +321,10 @@ async function forward(c: Context<{ Variables: Variables }>, path: string, rootK
         span.setAttribute("ingest.blocked", "quota_exceeded");
         logger.info({ path, projectId, signal }, "blocking ingest; org over plan quota");
         return c.json(
-          { error: "telemetry quota exceeded for this billing period; upgrade your plan to resume ingest" },
+          {
+            error:
+              "telemetry quota exceeded for this billing period; upgrade your plan to resume ingest",
+          },
           402,
         );
       }
@@ -412,6 +485,189 @@ async function forward(c: Context<{ Variables: Variables }>, path: string, rootK
   });
 }
 
+/**
+ * Resolve an ingest key to its project id, mirroring the /v1/* OTLP auth
+ * middleware (hash lookup, reject revoked). Returns null when the key is
+ * unknown or revoked. Bumps last_used_at best-effort so a project's key
+ * activity reflects Firehose ingest too — but skips the first-use Loops nudge,
+ * which the OTLP path already owns.
+ */
+async function resolveProjectIdForIngestKey(key: string): Promise<string | null> {
+  const row = await db.query.apiKeys.findFirst({
+    where: eq(schema.apiKeys.keyHash, hashApiKey(key)),
+  });
+  if (!row || row.revokedAt) return null;
+  void db
+    .update(schema.apiKeys)
+    .set({ lastUsedAt: new Date() })
+    .where(eq(schema.apiKeys.id, row.id))
+    .catch((err: unknown) => {
+      logger.warn({ err }, "failed to update last_used_at for firehose key");
+    });
+  return row.projectId;
+}
+
+/**
+ * Forward an AWS Data Firehose HTTP-endpoint batch to the collector's
+ * `awsfirehose` receiver. The proxy authenticates (X-Amz-Firehose-Access-Key →
+ * project), stamps the tenant header, forwards the required request id, and
+ * passes the collector's Firehose ack straight back — Option A from the spike:
+ * the receiver decodes the records and builds the `{requestId,timestamp}` ack
+ * itself.
+ *
+ * Firehose treats only a 200 as success; any other status is retried with
+ * back-off and, after the configured window, dropped to the customer's error
+ * bucket with the errorMessage we return. So every rejection returns a
+ * Firehose-spec body carrying the request id.
+ */
+async function forwardFirehose(
+  c: Context<{ Variables: Variables }>,
+  collectorUrl: string,
+  signal: "metrics" | "logs",
+) {
+  return tracer.startActiveSpan("ingest.firehose", async (span) => {
+    const requestId = c.req.header(FIREHOSE_REQUEST_ID_HEADER) ?? null;
+    const contentType = c.req.header("content-type") ?? "application/json";
+    const contentEncoding = c.req.header("content-encoding");
+    span.setAttribute("firehose.signal", signal);
+    span.setAttribute("firehose.has_request_id", requestId !== null);
+
+    // The source ARN's account id lets us (later) cross-check the stream against
+    // the project's cloud connection. For now record it for observability;
+    // tenancy is already pinned by the access key.
+    const sourceAccountId = parseAccountIdFromFirehoseArn(c.req.header(FIREHOSE_SOURCE_ARN_HEADER));
+    if (sourceAccountId) span.setAttribute("firehose.source_account_id", sourceAccountId);
+
+    const fail = (status: 400 | 401 | 402 | 413 | 500, message: string) => {
+      span.setAttribute("firehose.result", `error_${status}`);
+      span.setStatus({ code: SpanStatusCode.ERROR, message });
+      logger.warn({ signal, requestId, status, message }, "rejecting firehose batch");
+      return c.json(firehoseResponseBody(requestId ?? "unknown", message), status);
+    };
+
+    try {
+      // The receiver requires the request id; fail fast rather than forward a
+      // request it would 400 anyway.
+      if (!requestId) return fail(400, "missing X-Amz-Firehose-Request-Id header");
+
+      const key = c.req.header(FIREHOSE_ACCESS_KEY_HEADER);
+      if (!key) return fail(401, "missing X-Amz-Firehose-Access-Key header");
+
+      const projectId = await resolveProjectIdForIngestKey(key);
+      if (!projectId) return fail(401, "invalid api key");
+      span.setAttribute("tenant.project_id", projectId);
+
+      // Per-project source filter FIRST: if the project turned off its AWS
+      // source for this signal, ack-drop with a 200 success ack so Firehose
+      // treats it as delivered and doesn't retry into the customer's error
+      // bucket. This precedes the quota gate so disabling a source always wins
+      // over a 402 — otherwise a disabled-AND-over-quota stream would retry-storm
+      // and error-bucket, the exact outcome turning the source off should avoid.
+      if (!ingestSourceFilter.allows(projectId, "aws", signal)) {
+        span.setAttribute("ingest.dropped", "source_filtered");
+        span.setAttribute("firehose.result", "dropped");
+        logger.info({ signal, projectId, requestId }, "dropping firehose batch; source disabled");
+        return c.json(firehoseResponseBody(requestId), 200);
+      }
+
+      // Free-tier hard-block, same gate the OTLP path enforces — otherwise an
+      // over-quota org could keep streaming CloudWatch metrics/logs through
+      // Firehose. Cached + fail-open, so this is a cheap in-memory read. A 402 is
+      // a non-2xx to Firehose, so it backs off and (after the window) drops to
+      // the customer's error bucket rather than delivering.
+      const entitlementSignal = signal === "metrics" ? "metric_points" : "logs";
+      if (ingestGate && !ingestGate.allows(projectId, entitlementSignal)) {
+        span.setAttribute("ingest.blocked", "quota_exceeded");
+        return fail(
+          402,
+          "telemetry quota exceeded for this billing period; upgrade your plan to resume ingest",
+        );
+      }
+
+      const upstreamHeaders = buildFirehoseUpstreamHeaders({
+        projectId,
+        requestId,
+        contentType,
+        contentEncoding,
+      });
+      if (!upstreamHeaders) return fail(400, "missing X-Amz-Firehose-Request-Id header");
+
+      await requestSemaphore.acquire();
+      try {
+        const bodyStream = requestBodyStream(c);
+        if (!bodyStream) return fail(400, "empty Firehose request body");
+
+        let bodyBuffer: Buffer;
+        try {
+          bodyBuffer = await collectStreamWithCap(bodyStream, MAX_BODY_BYTES);
+        } catch (err) {
+          // 413 is a permanent failure to Firehose (not sent to the error
+          // bucket); an empty body is a 400. Anything else rethrows → 500.
+          if (err instanceof PayloadTooLargeError) {
+            return fail(413, `request body exceeds the ${err.limitBytes}-byte limit`);
+          }
+          if (err instanceof EmptyBodyError) return fail(400, "empty Firehose request body");
+          throw err;
+        }
+
+        const res = await tracer.startActiveSpan(
+          "ingest.firehose.collector_post",
+          async (postSpan) => {
+            postSpan.setAttribute("upstream.url", collectorUrl);
+            try {
+              const r = await fetch(collectorUrl, {
+                method: "POST",
+                headers: upstreamHeaders,
+                body: bodyBuffer,
+              });
+              postSpan.setAttribute("http.response.status_code", r.status);
+              if (r.status !== 200) {
+                postSpan.setStatus({
+                  code: SpanStatusCode.ERROR,
+                  message: `collector firehose receiver returned ${r.status}`,
+                });
+              }
+              return r;
+            } catch (err) {
+              postSpan.recordException(err as Error);
+              postSpan.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+              throw err;
+            } finally {
+              postSpan.end();
+            }
+          },
+        );
+
+        span.setAttribute("http.response.status_code", res.status);
+        span.setAttribute("firehose.result", res.status === 200 ? "ok" : `collector_${res.status}`);
+        logger.info({ signal, projectId, status: res.status }, "proxied firehose batch");
+
+        // Pass the receiver's ack through verbatim — it owns the
+        // {requestId,timestamp} body and the application/json content-type.
+        const resHeaders = new Headers();
+        resHeaders.set("content-type", res.headers.get("content-type") ?? "application/json");
+        return new Response(res.body, { status: res.status, headers: resHeaders });
+      } finally {
+        requestSemaphore.release();
+      }
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      // Keep the detailed error server-side only — the errorMessage we return is
+      // echoed by AWS into the customer's Firehose error logs / S3 error bucket,
+      // so it must not carry internal exception text (collector URLs, stack info).
+      logger.error({ err, signal, requestId }, "firehose proxy request failed");
+      // 500 (retriable) with a Firehose-shaped body so AWS backs off and retries.
+      return c.json(
+        firehoseResponseBody(requestId ?? "unknown", "internal error processing firehose request"),
+        500,
+      );
+    } finally {
+      span.end();
+    }
+  });
+}
+
 const server = serve({ fetch: app.fetch, port: PORT });
 // When deployed behind a load balancer (typically a 60s idle timeout), Node's
 // default 5s keepAliveTimeout closes idle keep-alive sockets the balancer still
@@ -459,7 +715,9 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
         resolve();
       }
     });
-    if (ingestQueue && ingestQueueConfig?.consumerEnabled) {
+    // stop() also flushes any sends still waiting on the batching linger, so a
+    // producer-only proxy (consumer disabled) must call it too.
+    if (ingestQueue) {
       await ingestQueue.stop();
     }
   } catch (err) {

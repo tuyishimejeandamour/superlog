@@ -2,11 +2,12 @@ import crypto from "node:crypto";
 import {
   db,
   listAccessibleGithubInstallsForProject,
+  recordInboundInteraction,
   resolveIncident,
   schema,
   syncLoopsContactsForOrg,
 } from "@superlog/db";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import type { Hono } from "hono";
 import type { Context } from "hono";
 import {
@@ -19,6 +20,8 @@ import { type RepoBranch, type RepoBranchInfo, mergeRepoBranches } from "./githu
 import { runResolvedIncidentSideEffectsForIncident } from "./incidents/resolution-side-effects.js";
 import { logger } from "./logger.js";
 import { resolveActiveOrgContext } from "./org-context.js";
+import { prTerminalTransition } from "./pr-metrics-transition.js";
+import { recordPrClosedMetric, recordPrMergedMetric } from "./pr-metrics.js";
 
 const log = logger.child({ scope: "github" });
 type Vars = { userId: string; orgId: string | null };
@@ -361,6 +364,9 @@ type WebhookPayload = {
     user?: GhActor;
     html_url?: string;
     author_association?: string;
+    // pull_request_review_comment only
+    path?: string;
+    line?: number | null;
   };
   review?: {
     id?: number;
@@ -604,6 +610,12 @@ async function handleAgentPrWebhook(
     log.warn({ err, event, agent_pr_id: agentPrRow.id }, "pr comment feedback capture failed");
   });
 
+  // Same best-effort posture: a follow-up enqueue failure must not 500 the
+  // webhook delivery.
+  await maybeRequestPrCommentFollowUp({ event, payload, agentPrRow }).catch((err) => {
+    log.warn({ err, event, agent_pr_id: agentPrRow.id }, "pr comment follow-up enqueue failed");
+  });
+
   const now = new Date();
 
   // Update the parent row when this is a state-changing event.
@@ -617,6 +629,15 @@ async function handleAgentPrWebhook(
     };
     if (pr.head?.sha) updates.headSha = pr.head.sha;
     if (typeof pr.title === "string") updates.title = pr.title;
+    // Decide whether this delivery looks like a brand-new terminal transition
+    // from the row we read. This is only a first cut — the read is stale under
+    // concurrent deliveries, so the actual once-only guarantee comes from the
+    // conditional UPDATE below, not from this check.
+    const countTransition = prTerminalTransition({
+      action,
+      merged: Boolean(pr.merged),
+      prevState: agentPrRow.state,
+    });
     if (action === "closed") {
       if (pr.merged) {
         updates.state = "merged";
@@ -636,10 +657,29 @@ async function handleAgentPrWebhook(
       updates.state = "open";
       updates.closedAt = null;
     }
-    await db
+    // For a terminal transition, fold the prior-state predicate into the WHERE
+    // so only one of N concurrent deliveries actually flips the row. `.returning`
+    // tells us which one won; the counter is incremented exactly once off that,
+    // not off the stale read above. Non-terminal updates (reopened, push-only
+    // field writes) stay unconditional.
+    const updated = await db
       .update(schema.agentPullRequests)
       .set(updates)
-      .where(eq(schema.agentPullRequests.id, agentPrRow.id));
+      .where(
+        countTransition
+          ? and(
+              eq(schema.agentPullRequests.id, agentPrRow.id),
+              ne(schema.agentPullRequests.state, countTransition),
+            )
+          : eq(schema.agentPullRequests.id, agentPrRow.id),
+      )
+      .returning({ id: schema.agentPullRequests.id });
+    const wonTransition = updated.length > 0;
+    if (countTransition === "merged" && wonTransition) {
+      await recordPrMergedMetric(agentPrRow.incidentId);
+    } else if (countTransition === "closed" && wonTransition) {
+      await recordPrClosedMetric(agentPrRow.incidentId);
+    }
     if (mergedResolution) {
       await resolveIncidentForMergedAgentPr({
         agentPr: agentPrRow,
@@ -706,10 +746,115 @@ async function resolveIncidentForMergedAgentPr(opts: {
       closePullRequest: (pr) =>
         closeAgentPullRequestOnGithub({
           installationId: pr.githubInstallationId,
+          fallbackInstallationIds: pr.fallbackGithubInstallationIds,
           repoFullName: pr.repoFullName,
           prNumber: pr.prNumber,
+          prNodeId: pr.prNodeId,
         }),
     });
+  }
+}
+
+type EligiblePrComment = {
+  body: string;
+  actor: GhActor;
+  commentUrl: string | null;
+  path: string | null;
+  line: number | null;
+  // Stable GitHub id of the comment/review — a deterministic dedupe key across
+  // webhook redelivery, used in preference to the URL.
+  sourceId: string | null;
+};
+
+// Shared gate for the comment-bearing PR events: real text from a real
+// (non-bot, repo-associated) human, excluding our own feedback footer.
+// PR open/close/merge has its own first-class handling and isn't a comment.
+function extractEligiblePrComment(
+  event: string,
+  payload: WebhookPayload,
+): EligiblePrComment | null {
+  let body: string | null = null;
+  let actor: GhActor = null;
+  let authorAssociation: string | null = null;
+  let commentUrl: string | null = null;
+  let path: string | null = null;
+  let line: number | null = null;
+  let sourceId: string | null = null;
+  if (event === "issue_comment" && payload.action === "created") {
+    body = payload.comment?.body ?? null;
+    actor = payload.comment?.user ?? null;
+    authorAssociation = payload.comment?.author_association ?? null;
+    commentUrl = payload.comment?.html_url ?? null;
+    sourceId = payload.comment?.id != null ? `issue_comment:${payload.comment.id}` : null;
+  } else if (event === "pull_request_review_comment" && payload.action === "created") {
+    body = payload.comment?.body ?? null;
+    actor = payload.comment?.user ?? null;
+    authorAssociation = payload.comment?.author_association ?? null;
+    commentUrl = payload.comment?.html_url ?? null;
+    path = payload.comment?.path ?? null;
+    line = payload.comment?.line ?? null;
+    sourceId = payload.comment?.id != null ? `review_comment:${payload.comment.id}` : null;
+  } else if (event === "pull_request_review" && payload.action === "submitted") {
+    body = payload.review?.body ?? null;
+    actor = payload.review?.user ?? null;
+    authorAssociation = payload.review?.author_association ?? null;
+    commentUrl = payload.review?.html_url ?? null;
+    sourceId = payload.review?.id != null ? `review:${payload.review.id}` : null;
+  } else {
+    return null;
+  }
+  if (!body || body.trim().length === 0) return null;
+
+  // Skip our own footer echoed back by the GitHub UI — the PR description
+  // itself is rendered into comment-like contexts occasionally (e.g. the
+  // squashed merge commit message), and we don't want our own "leave
+  // feedback" link surfaced as feedback.
+  if (body.includes(FEEDBACK_PR_FOOTER_MARKER)) return null;
+
+  if (
+    !isFeedbackEligibleCommenter({
+      userType: actor?.type ?? null,
+      authorAssociation,
+    })
+  ) {
+    return null;
+  }
+  return { body, actor, commentUrl, path, line, sourceId };
+}
+
+// Review feedback on an agent PR continues the SAME investigation session where
+// one survives (resume / steer, keeping the existing branch mounted), and only
+// cold-starts a fresh run when no session can be resumed. `detail.origin`
+// carries the comment so the worker routes the agent's reply back to the PR.
+// The comment URL is a stable dedupe key against GitHub webhook redelivery.
+async function maybeRequestPrCommentFollowUp(opts: {
+  event: string;
+  payload: WebhookPayload;
+  agentPrRow: schema.AgentPullRequest;
+}): Promise<void> {
+  const comment = extractEligiblePrComment(opts.event, opts.payload);
+  if (!comment) return;
+  const result = await recordInboundInteraction(db, {
+    incidentId: opts.agentPrRow.incidentId,
+    interaction: {
+      channel: "pr_comment",
+      author: comment.actor?.login ?? null,
+      text: comment.body,
+      url: comment.commentUrl,
+      path: comment.path,
+      line: comment.line,
+      occurredAt: new Date().toISOString(),
+    },
+    // Deterministic across GitHub webhook redelivery: stable comment/review id
+    // first, then the comment URL. Both are stable for a given comment, so a
+    // redelivery dedupes instead of enqueuing twice.
+    dedupeKey: `github:${comment.sourceId ?? comment.commentUrl ?? `${opts.agentPrRow.id}:${comment.body}`}`,
+  });
+  if (result.outcome === "skipped") {
+    log.info(
+      { incident_id: opts.agentPrRow.incidentId, reason: result.reason },
+      "pr comment did not continue the investigation",
+    );
   }
 }
 
@@ -719,46 +864,9 @@ async function maybeRecordPrCommentFeedback(opts: {
   agentPrRow: schema.AgentPullRequest;
 }): Promise<void> {
   const { event, payload, agentPrRow } = opts;
-  // Only the comment-bearing events count; PR open/close/merge has its
-  // own first-class handling and isn't user feedback.
-  let body: string | null = null;
-  let actor: GhActor = null;
-  let authorAssociation: string | null = null;
-  let commentUrl: string | null = null;
-  if (event === "issue_comment" && payload.action === "created") {
-    body = payload.comment?.body ?? null;
-    actor = payload.comment?.user ?? null;
-    authorAssociation = payload.comment?.author_association ?? null;
-    commentUrl = payload.comment?.html_url ?? null;
-  } else if (event === "pull_request_review_comment" && payload.action === "created") {
-    body = payload.comment?.body ?? null;
-    actor = payload.comment?.user ?? null;
-    authorAssociation = payload.comment?.author_association ?? null;
-    commentUrl = payload.comment?.html_url ?? null;
-  } else if (event === "pull_request_review" && payload.action === "submitted") {
-    body = payload.review?.body ?? null;
-    actor = payload.review?.user ?? null;
-    authorAssociation = payload.review?.author_association ?? null;
-    commentUrl = payload.review?.html_url ?? null;
-  } else {
-    return;
-  }
-  if (!body || body.trim().length === 0) return;
-
-  // Skip our own footer echoed back by the GitHub UI — the PR description
-  // itself is rendered into comment-like contexts occasionally (e.g. the
-  // squashed merge commit message), and we don't want our own "leave
-  // feedback" link surfaced as feedback.
-  if (body.includes(FEEDBACK_PR_FOOTER_MARKER)) return;
-
-  if (
-    !isFeedbackEligibleCommenter({
-      userType: actor?.type ?? null,
-      authorAssociation,
-    })
-  ) {
-    return;
-  }
+  const eligible = extractEligiblePrComment(event, payload);
+  if (!eligible) return;
+  const { body, actor, commentUrl } = eligible;
 
   // Resolve org + project via the agent PR's installation so the admin
   // inbox can show which org's PR this feedback is on.
@@ -1086,31 +1194,120 @@ export async function mergeGithubPullRequest(opts: {
 
 export async function closeAgentPullRequestOnGithub(opts: {
   installationId: number;
+  fallbackInstallationIds?: number[];
   repoFullName: string;
   prNumber: number;
+  prNodeId?: string | null;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
-  try {
-    const token = await createInstallationWriteToken(opts.installationId);
-    const res = await fetch(
-      `https://api.github.com/repos/${opts.repoFullName}/pulls/${opts.prNumber}`,
-      {
-        method: "PATCH",
-        headers: {
-          accept: "application/vnd.github+json",
-          authorization: `Bearer ${token}`,
-          "content-type": "application/json; charset=utf-8",
-          "x-github-api-version": "2022-11-28",
-          "user-agent": "superlog-api",
-        },
-        body: JSON.stringify({ state: "closed" }),
-      },
-    );
-    if (res.ok) return { ok: true };
-    const text = await res.text().catch(() => "");
-    return { ok: false, error: `github PATCH /pulls/${opts.prNumber} ${res.status} ${text}` };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  return closeGithubPullRequestWithInstallations({
+    installationIds: [opts.installationId, ...(opts.fallbackInstallationIds ?? [])],
+    repoFullName: opts.repoFullName,
+    prNumber: opts.prNumber,
+    prNodeId: opts.prNodeId,
+    userAgent: "superlog-api",
+    createWriteToken: createInstallationWriteToken,
+  });
+}
+
+export async function closeGithubPullRequestWithInstallations(opts: {
+  installationIds: number[];
+  repoFullName: string;
+  prNumber: number;
+  prNodeId?: string | null;
+  userAgent: string;
+  fetchImpl?: typeof fetch;
+  createWriteToken: (installationId: number) => Promise<string>;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const errors: string[] = [];
+  for (const installationId of dedupeInstallationIds(opts.installationIds)) {
+    try {
+      const token = await opts.createWriteToken(installationId);
+      const result = await closeGithubPullRequestWithToken({
+        token,
+        repoFullName: opts.repoFullName,
+        prNumber: opts.prNumber,
+        prNodeId: opts.prNodeId,
+        userAgent: opts.userAgent,
+        fetchImpl: opts.fetchImpl,
+      });
+      if (result.ok) return result;
+      errors.push(`installation ${installationId}: ${result.error}`);
+    } catch (err) {
+      errors.push(
+        `installation ${installationId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
+  return { ok: false, error: errors.join("; ") || "no github installations available" };
+}
+
+export async function closeGithubPullRequestWithToken(opts: {
+  token: string;
+  repoFullName: string;
+  prNumber: number;
+  prNodeId?: string | null;
+  userAgent: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const errors: string[] = [];
+  if (opts.prNodeId) {
+    const res = await fetchImpl("https://api.github.com/graphql", {
+      method: "POST",
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${opts.token}`,
+        "content-type": "application/json; charset=utf-8",
+        "x-github-api-version": "2022-11-28",
+        "user-agent": opts.userAgent,
+      },
+      body: JSON.stringify({
+        query: `mutation ClosePullRequest($pullRequestId: ID!) {
+          closePullRequest(input: { pullRequestId: $pullRequestId }) {
+            pullRequest { id closed }
+          }
+        }`,
+        variables: { pullRequestId: opts.prNodeId },
+      }),
+    });
+    const text = await res.text().catch(() => "");
+    if (res.ok) {
+      const data = text ? parseGithubGraphqlResponse(text) : {};
+      if (!data.errors?.length) return { ok: true };
+    }
+    errors.push(`github GraphQL closePullRequest ${res.status} ${text}`);
+  }
+
+  const res = await fetchImpl(
+    `https://api.github.com/repos/${opts.repoFullName}/pulls/${opts.prNumber}`,
+    {
+      method: "PATCH",
+      headers: {
+        accept: "application/vnd.github+json",
+        authorization: `Bearer ${opts.token}`,
+        "content-type": "application/json; charset=utf-8",
+        "x-github-api-version": "2022-11-28",
+        "user-agent": opts.userAgent,
+      },
+      body: JSON.stringify({ state: "closed" }),
+    },
+  );
+  if (res.ok) return { ok: true };
+  const text = await res.text().catch(() => "");
+  errors.push(`github PATCH /pulls/${opts.prNumber} ${res.status} ${text}`);
+  return { ok: false, error: errors.join("; ") };
+}
+
+function parseGithubGraphqlResponse(text: string): { errors?: unknown[] } {
+  try {
+    return JSON.parse(text) as { errors?: unknown[] };
+  } catch {
+    return { errors: [{ message: "invalid json response" }] };
+  }
+}
+
+function dedupeInstallationIds(values: number[]): number[] {
+  return [...new Set(values)];
 }
 
 // Safety ceiling on paginated GitHub list calls: 100 pages × 100 per page =

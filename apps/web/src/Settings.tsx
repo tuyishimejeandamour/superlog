@@ -4,7 +4,9 @@ import {
   type AgentSettings,
   type AutoMergeMethod,
   type AutoMergePolicy,
+  type CloudConnection,
   EMPTY_ISSUE_FILTER_CONFIG,
+  type IngestFilterState,
   type Integration,
   type IssueFilterClause,
   type IssueFilterConfig,
@@ -12,25 +14,33 @@ import {
   type LinearTicketInstruction,
   type LinearTicketPolicy,
   type PrPolicy,
+  type RepoBranch,
+  type StackComponent,
   type WebhookDelivery,
   type WebhookEndpoint,
   useAgentSettings,
+  useCloudConnections,
+  useCloudStackHealth,
+  useCreateCloudConnection,
   useCreateKey,
+  useCreateMcpToken,
   useCreateOrgProject,
   useCreateWebhook,
+  useDeleteCloudConnection,
   useDeleteOrgProject,
   useDeleteSlackRoute,
   useDeleteWebhook,
-  type RepoBranch,
   useGithubBranches,
   useGithubInstallation,
   useGrantOrgRepoToProject,
+  useIngestFilters,
   useIntegrations,
   useIssueFilterAttributeKeys,
   useIssueFilterAttributeValues,
   useIssueFilterPreview,
   useKeys,
   useLinearInstallation,
+  useMcpTokens,
   useMe,
   useMintOrgApiKey,
   useMintOrgGithubInstallUrl,
@@ -45,6 +55,7 @@ import {
   useRemoveIntegration,
   useResetGithubCommitAuthor,
   useRevokeKey,
+  useRevokeMcpToken,
   useRevokeOrgApiKey,
   useRevokeOrgGithubInstallation,
   useRevokeOrgRepoFromProject,
@@ -54,7 +65,9 @@ import {
   useSaveIntegration,
   useSaveOrgAgentSettings,
   useSaveOrgDigest,
+  useSetIngestFilters,
   useSetSlackRoute,
+  useSetupCloudStream,
   useSlackChannels,
   useSlackInstallation,
   useSlackRoute,
@@ -69,61 +82,35 @@ import {
   useUpdateGithubRepoAccess,
   useUpdateOrgProject,
   useUpdateWebhook,
+  useVerifyCloudConnection,
   useWebhookDeliveries,
   useWebhooks,
 } from "./api";
 import { Dropdown, type DropdownOption } from "./design/Dropdown.tsx";
 import { Btn, Chip, FieldLabel, Input, Label, Tile } from "./design/ui";
+import { AgentMemoriesCard } from "./settings/AgentMemoriesCard.tsx";
 import { BillingCard } from "./settings/BillingCard.tsx";
 import { OrgGeneralCard } from "./settings/OrgGeneralCard.tsx";
 import { OrgMembersCard } from "./settings/OrgMembersCard.tsx";
-
-type SettingsScope = "org" | "project";
-
-type OrgSectionId =
-  | "general"
-  | "members"
-  | "billing"
-  | "agent-guidance"
-  | "weekly-digest"
-  | "mgmt-keys"
-  | "github-install";
-type ProjectSectionId =
-  | "general"
-  | "integrations"
-  | "agent"
-  | "issue-filter"
-  | "slack-channel"
-  | "api-keys"
-  | "webhooks";
-type SectionId = OrgSectionId | ProjectSectionId;
-
-const ORG_SECTIONS: ReadonlyArray<{ id: OrgSectionId; label: string }> = [
-  { id: "general", label: "General" },
-  { id: "members", label: "Members" },
-  { id: "billing", label: "Billing" },
-  { id: "agent-guidance", label: "Agent guidance" },
-  { id: "weekly-digest", label: "Weekly digest" },
-  { id: "mgmt-keys", label: "Management API keys" },
-  { id: "github-install", label: "GitHub install" },
-];
-
-const PROJECT_SECTIONS: ReadonlyArray<{ id: ProjectSectionId; label: string }> = [
-  { id: "general", label: "General" },
-  { id: "integrations", label: "Integrations" },
-  { id: "agent", label: "Agent" },
-  { id: "issue-filter", label: "Issue filter" },
-  { id: "slack-channel", label: "Slack channel" },
-  { id: "api-keys", label: "API keys" },
-  { id: "webhooks", label: "Webhooks" },
-];
-
-const PROJECT_SECTION_IDS = new Set<string>(PROJECT_SECTIONS.map((s) => s.id));
-const ORG_SECTION_IDS = new Set<string>(ORG_SECTIONS.map((s) => s.id));
+import {
+  NEW_PROJECT_OPTION_VALUE,
+  ORG_NAV_GROUPS,
+  type OrgSectionId,
+  PROJECT_NAV_GROUPS,
+  type ProjectSectionId,
+  type SectionId,
+  type SettingsScope,
+  nextProjectIdAfterDelete,
+  projectPickerOptions,
+  resolveOrgSection,
+  resolveProjectSection,
+  shouldShowProjectPicker,
+} from "./settings/nav.ts";
+import { SettingsCard, SettingsCardFooter, SettingsRow } from "./settings/rows.tsx";
 
 type NavTarget = {
   scope?: SettingsScope;
-  projectId?: string;
+  projectId?: string | null;
   section?: SectionId;
 };
 
@@ -162,14 +149,7 @@ export function Settings() {
   }, [scope, projectIdParam, projects, defaultProjectId]);
 
   const activeSection: SectionId = useMemo(() => {
-    if (scope === "org") {
-      return sectionParam && ORG_SECTION_IDS.has(sectionParam)
-        ? (sectionParam as OrgSectionId)
-        : ORG_SECTIONS[0]!.id;
-    }
-    return sectionParam && PROJECT_SECTION_IDS.has(sectionParam)
-      ? (sectionParam as ProjectSectionId)
-      : PROJECT_SECTIONS[0]!.id;
+    return scope === "org" ? resolveOrgSection(sectionParam) : resolveProjectSection(sectionParam);
   }, [scope, sectionParam]);
 
   const navigate = (next: NavTarget) => {
@@ -178,13 +158,18 @@ export function Settings() {
       if (next.scope === "project") updated.delete("scope");
       else updated.set("scope", next.scope);
     }
-    if (next.projectId) updated.set("projectId", next.projectId);
+    if (next.projectId !== undefined) {
+      if (next.projectId) updated.set("projectId", next.projectId);
+      else updated.delete("projectId");
+    }
     if (next.section) updated.set("section", next.section);
     setParams(updated, { replace: true });
   };
 
+  const [creatingProject, setCreatingProject] = useState(false);
+
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       {(linearStatus || githubStatus || githubAuthorStatus) && (
         <header className="space-y-2">
           {linearStatus && <LinearStatusBanner status={linearStatus} />}
@@ -193,21 +178,42 @@ export function Settings() {
         </header>
       )}
 
+      <SettingsTabs
+        scope={scope}
+        projects={projects}
+        activeProjectId={activeProjectId}
+        onNavigate={navigate}
+        onCreateProject={() => setCreatingProject(true)}
+      />
+
       <div className="flex flex-col gap-8 md:flex-row md:items-start">
-        <SettingsSidebar
-          scope={scope}
-          section={activeSection}
-          projects={projects}
-          activeProjectId={activeProjectId}
-          onNavigate={navigate}
-        />
+        <SettingsSideNav scope={scope} section={activeSection} onNavigate={navigate} />
         <div className="min-w-0 flex-1">
+          {creatingProject && (
+            <div className="mb-6 max-w-sm rounded-lg border border-border bg-surface p-3">
+              <p className="mb-2 text-[13px] font-medium text-fg">New project</p>
+              <NewProjectForm
+                onCancel={() => setCreatingProject(false)}
+                onCreated={(p) => {
+                  setCreatingProject(false);
+                  navigate({ scope: "project", projectId: p.id, section: "general" });
+                }}
+              />
+            </div>
+          )}
           {scope === "org" ? (
             <OrgSectionView section={activeSection as OrgSectionId} />
           ) : (
             <ProjectSectionView
               section={activeSection as ProjectSectionId}
               projectId={activeProjectId}
+              onProjectDeleted={(nextProjectId) => {
+                navigate({
+                  scope: "project",
+                  projectId: nextProjectId ?? null,
+                  section: "general",
+                });
+              }}
             />
           )}
         </div>
@@ -216,334 +222,231 @@ export function Settings() {
   );
 }
 
-function SettingsSidebar({
+function SettingsTabs({
   scope,
-  section,
   projects,
   activeProjectId,
+  onNavigate,
+  onCreateProject,
+}: {
+  scope: SettingsScope;
+  projects: Array<{ id: string; name: string }>;
+  activeProjectId: string | undefined;
+  onNavigate: (target: NavTarget) => void;
+  onCreateProject: () => void;
+}) {
+  const pickerOptions: DropdownOption[] = projectPickerOptions(projects);
+  return (
+    <div className="flex items-end gap-7 border-b border-border">
+      <TabButton
+        label="Organization"
+        active={scope === "org"}
+        onClick={() => onNavigate({ scope: "org", section: "general" })}
+      />
+      <TabButton
+        label="Project"
+        active={scope === "project"}
+        onClick={() => onNavigate({ scope: "project", section: "general" })}
+      />
+      <div className="flex-1" />
+      {shouldShowProjectPicker(scope) && (
+        <div className="pb-2">
+          <Dropdown
+            value={activeProjectId ?? ""}
+            onChange={(v) => {
+              if (v === NEW_PROJECT_OPTION_VALUE) {
+                onCreateProject();
+                return;
+              }
+              onNavigate({ scope: "project", projectId: v });
+            }}
+            options={pickerOptions}
+            searchable={projects.length > 6}
+            className="w-52"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabButton({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`-mb-px border-b-2 pb-2.5 pt-1 text-[14px] transition-colors ${
+        active
+          ? "border-fg font-semibold text-fg"
+          : "border-transparent font-medium text-muted hover:text-fg"
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function SettingsSideNav({
+  scope,
+  section,
   onNavigate,
 }: {
   scope: SettingsScope;
   section: SectionId;
-  projects: Array<{ id: string; name: string }>;
-  activeProjectId: string | undefined;
   onNavigate: (target: NavTarget) => void;
 }) {
-  const [creating, setCreating] = useState(false);
-  const projectSection: ProjectSectionId = PROJECT_SECTION_IDS.has(section)
-    ? (section as ProjectSectionId)
-    : "integrations";
+  const groups = scope === "org" ? ORG_NAV_GROUPS : PROJECT_NAV_GROUPS;
   return (
-    <nav className="shrink-0 md:sticky md:top-6 md:w-60">
+    <nav className="shrink-0 md:sticky md:top-6 md:w-56">
       <ul className="flex flex-col gap-0.5">
-        <SidebarItem
-          label="Org"
-          icon={<OrgIcon />}
-          active={scope === "org"}
-          onClick={() =>
-            onNavigate({
-              scope: "org",
-              section: ORG_SECTION_IDS.has(section)
-                ? (section as OrgSectionId)
-                : ORG_SECTIONS[0]!.id,
-            })
-          }
-        />
-        {scope === "org" && (
-          <ul className="ml-[22px] mt-0.5 mb-1 flex flex-col gap-0.5 border-l border-border pl-2">
-            {ORG_SECTIONS.map((s) => (
-              <SidebarLeaf
-                key={s.id}
-                label={s.label}
-                active={section === s.id}
-                onClick={() => onNavigate({ scope: "org", section: s.id })}
-              />
-            ))}
-          </ul>
-        )}
-
-        <li className="mt-3 mb-1 flex items-center justify-between px-3">
-          <span className="text-[11px] uppercase tracking-wider text-muted">Projects</span>
-          <button
-            type="button"
-            onClick={() => setCreating((v) => !v)}
-            aria-label="New project"
-            className="flex h-5 w-5 items-center justify-center rounded-sm text-muted hover:bg-surface-2 hover:text-fg"
-          >
-            <svg
-              width="14"
-              height="14"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden
-            >
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-          </button>
-        </li>
-        {creating && (
-          <li className="mb-1 px-1">
-            <NewProjectForm
-              onCancel={() => setCreating(false)}
-              onCreated={(p) => {
-                setCreating(false);
-                onNavigate({ scope: "project", projectId: p.id, section: "general" });
-              }}
-            />
+        {groups.map((group, gi) => (
+          <li key={group.label ?? gi}>
+            {group.label && (
+              <p className="mb-1 mt-4 px-3 text-[11px] uppercase tracking-wider text-muted">
+                {group.label}
+              </p>
+            )}
+            <ul className="flex flex-col gap-0.5">
+              {group.items.map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    onClick={() => onNavigate({ scope, section: item.id })}
+                    className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-[13px] transition-colors ${
+                      section === item.id
+                        ? "bg-surface-2 text-fg"
+                        : "text-muted hover:bg-surface-2 hover:text-fg"
+                    }`}
+                  >
+                    <span className="flex h-4 w-4 items-center justify-center" aria-hidden>
+                      <SectionIcon scope={scope} section={item.id} />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
           </li>
-        )}
-
-        {projects.map((p) => {
-          const isActive = scope === "project" && activeProjectId === p.id;
-          return (
-            <li key={p.id}>
-              <ProjectRow
-                project={p}
-                active={isActive}
-                canDelete={projects.length > 1}
-                onSelect={() =>
-                  onNavigate({
-                    scope: "project",
-                    projectId: p.id,
-                    section: projectSection,
-                  })
-                }
-                onDeleted={() => {
-                  if (isActive) {
-                    const next = projects.find((q) => q.id !== p.id);
-                    if (next) {
-                      onNavigate({
-                        scope: "project",
-                        projectId: next.id,
-                        section: "integrations",
-                      });
-                    }
-                  }
-                }}
-              />
-              {isActive && (
-                <ul className="ml-[22px] mt-0.5 mb-1 flex flex-col gap-0.5 border-l border-border pl-2">
-                  {PROJECT_SECTIONS.map((s) => (
-                    <SidebarLeaf
-                      key={s.id}
-                      label={s.label}
-                      active={section === s.id}
-                      onClick={() =>
-                        onNavigate({ scope: "project", projectId: p.id, section: s.id })
-                      }
-                    />
-                  ))}
-                </ul>
-              )}
-            </li>
-          );
-        })}
+        ))}
       </ul>
     </nav>
   );
 }
 
-function SidebarItem({
-  label,
-  icon,
-  active,
-  onClick,
-}: {
-  label: string;
-  icon: ReactNode;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <li>
-      <button
-        type="button"
-        onClick={onClick}
-        className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-[13px] transition-colors ${
-          active ? "bg-surface-2 text-fg" : "text-muted hover:bg-surface-2 hover:text-fg"
-        }`}
-      >
-        <span className="flex h-4 w-4 items-center justify-center text-current" aria-hidden>
-          {icon}
-        </span>
-        <span className="min-w-0 flex-1 truncate">{label}</span>
-      </button>
-    </li>
-  );
-}
-
-function SidebarLeaf({
-  label,
-  active,
-  onClick,
-}: {
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <li>
-      <button
-        type="button"
-        onClick={onClick}
-        className={`flex w-full items-center rounded-md px-2 py-1.5 text-left text-[12.5px] transition-colors ${
-          active ? "bg-surface-2 text-fg" : "text-muted hover:bg-surface-2 hover:text-fg"
-        }`}
-      >
-        <span className="min-w-0 flex-1 truncate">{label}</span>
-      </button>
-    </li>
-  );
-}
-
-function ProjectRow({
-  project,
-  active,
-  canDelete,
-  onSelect,
-  onDeleted,
-}: {
-  project: { id: string; name: string };
-  active: boolean;
-  canDelete: boolean;
-  onSelect: () => void;
-  onDeleted: () => void;
-}) {
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [renaming, setRenaming] = useState(false);
-  const [draft, setDraft] = useState(project.name);
-  const update = useUpdateOrgProject();
-  const del = useDeleteOrgProject();
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const onDown = () => setMenuOpen(false);
-    window.addEventListener("click", onDown);
-    return () => window.removeEventListener("click", onDown);
-  }, [menuOpen]);
-
-  if (renaming) {
-    const submit = (e: React.FormEvent) => {
-      e.preventDefault();
-      const name = draft.trim();
-      if (!name || name === project.name) {
-        setRenaming(false);
-        setDraft(project.name);
-        return;
-      }
-      update.mutate(
-        { projectId: project.id, patch: { name } },
-        {
-          onSuccess: () => setRenaming(false),
-          onError: () => {
-            setRenaming(false);
-            setDraft(project.name);
-          },
-        },
-      );
-    };
-    return (
-      <form onSubmit={submit} className="flex items-center gap-1 px-3 py-1.5">
-        <input
-          autoFocus
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={(e) => {
-            // Form's onSubmit may have already fired via Enter; don't issue a
-            // second PATCH while the first is still in flight.
-            if (!update.isPending) submit(e);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              setRenaming(false);
-              setDraft(project.name);
-            }
-          }}
-          className="h-7 w-full rounded-sm border border-border bg-surface-2 px-2 text-[13px] text-fg focus:border-border-strong focus:outline-none"
-        />
-      </form>
-    );
-  }
-
-  return (
-    <div className="group relative flex items-center">
-      <button
-        type="button"
-        onClick={onSelect}
-        className={`flex min-w-0 flex-1 items-center gap-3 rounded-md px-3 py-2 text-left text-[13px] transition-colors ${
-          active ? "bg-surface-2 text-fg" : "text-muted hover:bg-surface-2 hover:text-fg"
-        }`}
-      >
-        <span className="flex h-4 w-4 items-center justify-center text-current" aria-hidden>
-          <ProjectIcon />
-        </span>
-        <span className="min-w-0 flex-1 truncate">{project.name}</span>
-      </button>
-      <button
-        type="button"
-        aria-label="Project menu"
-        onClick={(e) => {
-          e.stopPropagation();
-          setMenuOpen((v) => !v);
-        }}
-        className={`absolute right-1 flex h-6 w-6 items-center justify-center rounded-sm text-muted hover:bg-surface-3 hover:text-fg ${
-          menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 focus:opacity-100"
-        }`}
-      >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-          <circle cx="5" cy="12" r="1.5" />
-          <circle cx="12" cy="12" r="1.5" />
-          <circle cx="19" cy="12" r="1.5" />
+function SectionIcon({ scope, section }: { scope: SettingsScope; section: SectionId }) {
+  const props = {
+    width: 16,
+    height: 16,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1.7,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+  } as const;
+  const key = `${scope}:${section}`;
+  switch (key) {
+    case "org:general":
+    case "project:general":
+      return (
+        <svg {...props} aria-hidden="true">
+          <line x1="4" y1="8" x2="20" y2="8" />
+          <line x1="4" y1="16" x2="20" y2="16" />
+          <circle cx="9" cy="8" r="2" />
+          <circle cx="15" cy="16" r="2" />
         </svg>
-      </button>
-      {menuOpen && (
-        <div
-          className="absolute right-0 top-full z-10 mt-1 w-32 overflow-hidden rounded-sm border border-border bg-surface-1 shadow-lg"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              setMenuOpen(false);
-              setDraft(project.name);
-              setRenaming(true);
-            }}
-            className="block w-full px-3 py-1.5 text-left text-[12.5px] text-fg hover:bg-surface-2"
-          >
-            Rename
-          </button>
-          <button
-            type="button"
-            disabled={!canDelete || del.isPending}
-            onClick={() => {
-              setMenuOpen(false);
-              if (!canDelete) return;
-              const ok = window.confirm(
-                `Delete project "${project.name}"? Telemetry, API keys, and integrations for this project will be deleted. This cannot be undone.`,
-              );
-              if (!ok) return;
-              del.mutate(project.id, {
-                onSuccess: () => onDeleted(),
-                onError: (err) => {
-                  window.alert(
-                    `Delete failed: ${err instanceof Error ? err.message : String(err)}`,
-                  );
-                },
-              });
-            }}
-            className="block w-full px-3 py-1.5 text-left text-[12.5px] text-danger hover:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40"
-            title={canDelete ? undefined : "Can't delete the last project in an org"}
-          >
-            Delete
-          </button>
-        </div>
-      )}
-    </div>
-  );
+      );
+    case "org:members":
+      return (
+        <svg {...props} aria-hidden="true">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+          <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        </svg>
+      );
+    case "org:billing":
+      return (
+        <svg {...props} aria-hidden="true">
+          <rect x="1" y="4" width="22" height="16" rx="2" />
+          <line x1="1" y1="10" x2="23" y2="10" />
+        </svg>
+      );
+    case "org:agent-guidance":
+    case "project:agent":
+      return (
+        <svg {...props} aria-hidden="true">
+          <path d="M12 3a7 7 0 0 1 7 7v3a7 7 0 0 1-14 0v-3a7 7 0 0 1 7-7z" />
+          <circle cx="9" cy="12" r="0.5" fill="currentColor" />
+          <circle cx="15" cy="12" r="0.5" fill="currentColor" />
+        </svg>
+      );
+    case "org:mgmt-keys":
+    case "project:api-keys":
+      return (
+        <svg {...props} aria-hidden="true">
+          <circle cx="7.5" cy="15.5" r="5.5" />
+          <path d="m21 2-9.6 9.6" />
+          <path d="m15.5 7.5 3 3L22 7l-3-3" />
+        </svg>
+      );
+    case "org:github-install":
+      return (
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z" />
+        </svg>
+      );
+    case "project:integrations":
+      return (
+        <svg {...props} aria-hidden="true">
+          <path d="M9 2v6" />
+          <path d="M15 2v6" />
+          <path d="M6 8h12v4a6 6 0 0 1-12 0V8z" />
+          <path d="M12 18v4" />
+        </svg>
+      );
+    case "project:mcp-tokens":
+      return (
+        <svg {...props} aria-hidden="true">
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="m7 9 3 3-3 3" />
+          <path d="M13 15h4" />
+        </svg>
+      );
+    case "project:issue-filter":
+      return (
+        <svg {...props} aria-hidden="true">
+          <path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3z" />
+        </svg>
+      );
+    case "project:slack-channel":
+      return (
+        <svg {...props} aria-hidden="true">
+          <line x1="10" y1="3" x2="7" y2="21" />
+          <line x1="17" y1="3" x2="14" y2="21" />
+          <line x1="3" y1="9" x2="21" y2="9" />
+          <line x1="3" y1="15" x2="21" y2="15" />
+        </svg>
+      );
+    case "project:webhooks":
+      return (
+        <svg {...props} aria-hidden="true">
+          <path d="M18 16.98h-5.99c-1.1 0-1.95.94-2.48 1.9A4 4 0 0 1 2 17c.01-.7.2-1.4.57-2" />
+          <path d="m6 17 3.13-5.78c.53-.97.1-2.18-.5-3.1a4 4 0 1 1 6.89-4.06" />
+          <path d="m12 6 3.13 5.73C15.66 12.7 16.9 13 18 13a4 4 0 0 1 0 8" />
+        </svg>
+      );
+    default:
+      return null;
+  }
 }
 
 function NewProjectForm({
@@ -583,7 +486,7 @@ function NewProjectForm({
         }}
         placeholder="Project name"
         disabled={create.isPending}
-        className="h-7 w-full rounded-sm border border-border bg-surface-2 px-2 text-[13px] text-fg focus:border-border-strong focus:outline-none"
+        className="h-7 w-full rounded-lg border border-border bg-surface-2 px-2 text-[13px] text-fg focus:border-border-strong focus:outline-none"
       />
       {error && <span className="px-1 text-[11px] text-danger">{error}</span>}
       <div className="flex items-center gap-1">
@@ -598,55 +501,24 @@ function NewProjectForm({
   );
 }
 
-function OrgIcon() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M3 21h18" />
-      <path d="M5 21V7l8-4v18" />
-      <path d="M19 21V11l-6-4" />
-      <path d="M9 9v.01" />
-      <path d="M9 13v.01" />
-      <path d="M9 17v.01" />
-    </svg>
-  );
-}
-
-function ProjectIcon() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-    </svg>
-  );
-}
-
 function OrgSectionView({ section }: { section: OrgSectionId }) {
   switch (section) {
     case "general":
       return (
-        <Section
-          title="General"
-          subtitle="Organization name and slug. Visible to everyone in the org."
-        >
-          <OrgGeneralCard />
-        </Section>
+        <div className="space-y-10">
+          <Section
+            title="General"
+            subtitle="Organization name and slug. Visible to everyone in the org."
+          >
+            <OrgGeneralCard />
+          </Section>
+          <Section
+            title="Weekly fixes digest"
+            subtitle="A short Slack recap of the top 3 pending bug-fix PRs, ranked by an LLM."
+          >
+            <WeeklyDigestCard />
+          </Section>
+        </div>
       );
     case "members":
       return (
@@ -670,15 +542,6 @@ function OrgSectionView({ section }: { section: OrgSectionId }) {
           subtitle="Prepended to every agent run prompt across all projects in this org."
         >
           <OrgGuidanceCard />
-        </Section>
-      );
-    case "weekly-digest":
-      return (
-        <Section
-          title="Weekly fixes digest"
-          subtitle="A short Slack recap of the top 3 pending bug-fix PRs, ranked by an LLM."
-        >
-          <WeeklyDigestCard />
         </Section>
       );
     case "mgmt-keys":
@@ -705,9 +568,11 @@ function OrgSectionView({ section }: { section: OrgSectionId }) {
 function ProjectSectionView({
   section,
   projectId,
+  onProjectDeleted,
 }: {
   section: ProjectSectionId;
   projectId: string | undefined;
+  onProjectDeleted: (nextProjectId: string | undefined) => void;
 }) {
   switch (section) {
     case "general":
@@ -716,7 +581,7 @@ function ProjectSectionView({
           title="General"
           subtitle="Project name, slug, and context available to investigations."
         >
-          <ProjectGeneralCard projectId={projectId} />
+          <ProjectGeneralCard projectId={projectId} onDeleted={onProjectDeleted} />
         </Section>
       );
     case "integrations":
@@ -726,6 +591,8 @@ function ProjectSectionView({
             <GithubCard />
             <SlackCard />
             <LinearCard />
+            <AwsCard projectId={projectId} />
+            <IngestSourcesCard projectId={projectId} />
           </div>
         </Section>
       );
@@ -736,6 +603,15 @@ function ProjectSectionView({
           subtitle="The flow each incident runs through. Toggle steps and configure their policies."
         >
           <AgentFlowchart projectId={projectId} />
+        </Section>
+      );
+    case "agent-memories":
+      return (
+        <Section
+          title="Agent memories"
+          subtitle="Durable facts the investigation agent carries across runs of this project — terminology, infra layout, lessons from your feedback. The agent saves these itself; review and prune them here."
+        >
+          <AgentMemoriesCard projectId={projectId} />
         </Section>
       );
     case "issue-filter":
@@ -765,6 +641,15 @@ function ProjectSectionView({
           <ApiKeysCard projectId={projectId} />
         </Section>
       );
+    case "mcp-tokens":
+      return (
+        <Section
+          title="MCP tokens"
+          subtitle="Personal access tokens for the Superlog MCP server — an alternative to the browser OAuth flow. Paste one into your agent as a static Authorization header."
+        >
+          <McpTokensCard projectId={projectId} />
+        </Section>
+      );
     case "webhooks":
       return (
         <Section
@@ -779,12 +664,21 @@ function ProjectSectionView({
 
 const PROJECT_CONTEXT_MAX_LEN = 8000;
 
-function ProjectGeneralCard({ projectId }: { projectId: string | undefined }) {
+function ProjectGeneralCard({
+  projectId,
+  onDeleted,
+}: {
+  projectId: string | undefined;
+  onDeleted: (nextProjectId: string | undefined) => void;
+}) {
   const projectsQ = useOrgProjects();
   const update = useUpdateOrgProject();
-  const project = projectsQ.data?.projects.find((p) => p.id === projectId) ?? null;
+  const del = useDeleteOrgProject();
+  const projects = projectsQ.data?.projects ?? [];
+  const project = projects.find((p) => p.id === projectId) ?? null;
   const value = project?.projectContext ?? "";
   const [draft, setDraft] = useState(value);
+  const [nameDraft, setNameDraft] = useState(project?.name ?? "");
   const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [savedTick, setSavedTick] = useState(false);
@@ -793,49 +687,74 @@ function ProjectGeneralCard({ projectId }: { projectId: string | undefined }) {
     if (!project) return;
     if (loadedProjectId === project.id) return;
     setDraft(project.projectContext);
+    setNameDraft(project.name);
     setLoadedProjectId(project.id);
     setError(null);
   }, [loadedProjectId, project]);
 
   const loaded = !!project && loadedProjectId === project.id;
-  const dirty = loaded && draft !== value;
+  const nameDirty = loaded && nameDraft.trim() !== project.name && nameDraft.trim().length > 0;
+  const dirty = (loaded && draft !== value) || nameDirty;
   const disabled = !loaded || projectsQ.isLoading || update.isPending;
+  const canDelete = projects.length > 1;
 
   return (
-    <Tile>
-      <div className="space-y-4">
-        <div className="grid gap-4 md:grid-cols-2">
-          <div>
-            <span className="mb-1.5 block text-[12px] text-muted">Project name</span>
-            <Input value={project?.name ?? ""} disabled />
-          </div>
-          <div>
-            <span className="mb-1.5 block text-[12px] text-muted">Slug</span>
-            <Input value={project?.slug ?? ""} disabled />
-          </div>
-        </div>
-
-        <div className="space-y-2">
-          <FieldLabel>Project context</FieldLabel>
+    <div className="space-y-4">
+      <SettingsCard>
+        <SettingsRow
+          title="Name"
+          description="Shown across the app and in incident threads"
+          control={
+            <div className="w-60">
+              <Input
+                value={nameDraft}
+                disabled={disabled}
+                onChange={(e) => setNameDraft(e.target.value)}
+              />
+            </div>
+          }
+        />
+        <SettingsRow
+          title="Slug"
+          description="Used in URLs — fixed after creation"
+          control={
+            <div className="w-60">
+              <Input className="font-mono text-[12.5px]" value={project?.slug ?? ""} disabled />
+            </div>
+          }
+        />
+        <SettingsRow
+          title="Project context"
+          description="Included as project context for investigations in this project"
+        >
           <textarea
             value={draft}
             disabled={disabled}
             onChange={(e) => setDraft(e.target.value.slice(0, PROJECT_CONTEXT_MAX_LEN))}
             rows={7}
             placeholder="e.g. This project is the billing API. Stripe customer IDs are org-scoped. Prefer touching packages/billing before app code."
-            className="w-full rounded-sm border border-border bg-surface-2 p-3 font-mono text-[12.5px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
+            className="w-full rounded-lg border border-border bg-surface-2 p-3 font-mono text-[12.5px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
           />
-          <div className="flex items-center justify-between text-[12px] text-muted">
-            <span>Included as project context for investigations in this project.</span>
-            <span className="font-mono tabular-nums">
-              {draft.length} / {PROJECT_CONTEXT_MAX_LEN}
-            </span>
+          <div className="mt-1 flex justify-end font-mono text-[12px] tabular-nums text-muted">
+            {draft.length} / {PROJECT_CONTEXT_MAX_LEN}
           </div>
-        </div>
-
-        {error && <p className="text-[12px] text-danger">{error}</p>}
-
-        <div className="flex items-center gap-2">
+        </SettingsRow>
+        <SettingsCardFooter>
+          {error && <span className="mr-auto text-[12px] text-danger">{error}</span>}
+          {savedTick && <span className="text-[12px] text-success">Saved</span>}
+          {dirty && (
+            <Btn
+              size="sm"
+              variant="ghost"
+              disabled={update.isPending}
+              onClick={() => {
+                setDraft(value);
+                setNameDraft(project?.name ?? "");
+              }}
+            >
+              Discard
+            </Btn>
+          )}
           <Btn
             size="sm"
             variant="primary"
@@ -845,7 +764,13 @@ function ProjectGeneralCard({ projectId }: { projectId: string | undefined }) {
               if (!project || !loaded) return;
               setError(null);
               update.mutate(
-                { projectId: project.id, patch: { projectContext: draft } },
+                {
+                  projectId: project.id,
+                  patch: {
+                    projectContext: draft,
+                    ...(nameDirty ? { name: nameDraft.trim() } : {}),
+                  },
+                },
                 {
                   onSuccess: () => {
                     setSavedTick(true);
@@ -856,22 +781,46 @@ function ProjectGeneralCard({ projectId }: { projectId: string | undefined }) {
               );
             }}
           >
-            Save context
+            Save
           </Btn>
-          {dirty && (
+        </SettingsCardFooter>
+      </SettingsCard>
+
+      <SettingsCard>
+        <SettingsRow
+          title="Delete project"
+          description="Telemetry, API keys, and integrations for this project will be deleted. This cannot be undone."
+          control={
             <Btn
               size="sm"
-              variant="ghost"
-              disabled={update.isPending}
-              onClick={() => setDraft(value)}
+              variant="danger"
+              disabled={!project || !canDelete || del.isPending}
+              loading={del.isPending}
+              onClick={() => {
+                if (!project || !canDelete) return;
+                const ok = window.confirm(
+                  `Delete project "${project.name}"? Telemetry, API keys, and integrations for this project will be deleted. This cannot be undone.`,
+                );
+                if (!ok) return;
+                const nextProjectId = nextProjectIdAfterDelete(projects, project.id);
+                del.mutate(project.id, {
+                  onSuccess: () => {
+                    onDeleted(nextProjectId);
+                  },
+                  onError: (err) => {
+                    window.alert(
+                      `Delete failed: ${err instanceof Error ? err.message : String(err)}`,
+                    );
+                  },
+                });
+              }}
             >
-              Discard
+              Delete
             </Btn>
-          )}
-          {savedTick && <span className="text-[12px] text-success">Saved</span>}
-        </div>
-      </div>
-    </Tile>
+          }
+        />
+      </SettingsCard>
+    </div>
   );
 }
 
@@ -1243,63 +1192,18 @@ function SlackRoutingCard({ projectId }: { projectId: string | undefined }) {
   }
 
   return (
-    <Tile>
-      <div className="space-y-4">
-        <div>
-          {configured ? (
-            <Chip tone="success" dot>
-              Posting to #{currentChannelName ?? currentChannelId}
-            </Chip>
-          ) : (
-            <Chip tone="muted" dot>
-              Disabled — incidents are not posted to Slack
-            </Chip>
-          )}
-        </div>
-
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="min-w-[260px] flex-1">
-            <FieldLabel>Channel</FieldLabel>
-            <Dropdown
-              value={pendingChannelId}
-              onChange={setPendingChannelId}
-              disabled={!projectId || channels.isLoading || channels.isError}
-              placeholder={
-                channels.isLoading
-                  ? "Loading channels…"
-                  : channels.isError
-                    ? "Failed to load channels"
-                    : "Select a channel…"
-              }
-              emptyLabel="No channels found"
-              options={channelList.map((ch) => ({
-                value: ch.id,
-                searchText: `${ch.isPrivate ? "🔒 " : "#"}${ch.name}`,
-                label: (
-                  <span className="flex items-center gap-1.5">
-                    <span className="text-subtle">{ch.isPrivate ? "🔒" : "#"}</span>
-                    <span>{ch.name}</span>
-                  </span>
-                ),
-              }))}
-            />
-          </div>
-          <Btn
-            size="md"
-            variant="primary"
-            disabled={!projectId || !dirty || setRoute.isPending}
-            loading={setRoute.isPending}
-            onClick={async () => {
-              const ch = channelList.find((c) => c.id === pendingChannelId);
-              if (!ch) return;
-              await setRoute.mutateAsync(ch);
-            }}
-          >
-            {configured ? "Update channel" : "Enable"}
-          </Btn>
-          {configured && (
+    <SettingsCard>
+      <SettingsRow
+        title="Incident threads"
+        description={
+          configured
+            ? `Posting to #${currentChannelName ?? currentChannelId}`
+            : "Disabled — incidents are not posted to Slack"
+        }
+        control={
+          configured ? (
             <Btn
-              size="md"
+              size="sm"
               variant="danger"
               disabled={!projectId || deleteRoute.isPending}
               loading={deleteRoute.isPending}
@@ -1307,20 +1211,68 @@ function SlackRoutingCard({ projectId }: { projectId: string | undefined }) {
             >
               Disable
             </Btn>
-          )}
-        </div>
-
-        {channels.isError ? (
-          <p className="text-[12px] text-muted">Couldn't fetch the channel list — try reconnecting Slack.</p>
-        ) : (
-          <p className="text-[12px] text-muted">
-            Don't see a private channel? Slack only lists private channels the bot belongs to — run{" "}
-            <code className="rounded-sm bg-surface-2 px-1 py-0.5 text-[11px]">/invite @Superlog</code>{" "}
-            in that channel, then reopen this list.
-          </p>
-        )}
-      </div>
-    </Tile>
+          ) : undefined
+        }
+      />
+      <SettingsRow
+        title="Channel"
+        description={
+          channels.isError ? (
+            "Couldn't fetch the channel list — try reconnecting Slack."
+          ) : (
+            <>
+              Private channels only appear once the bot is invited — run{" "}
+              <code className="rounded-sm bg-surface-2 px-1 py-0.5 text-[11px]">
+                /invite @Superlog
+              </code>{" "}
+              there first
+            </>
+          )
+        }
+        control={
+          <>
+            <div className="w-60">
+              <Dropdown
+                value={pendingChannelId}
+                onChange={setPendingChannelId}
+                disabled={!projectId || channels.isLoading || channels.isError}
+                placeholder={
+                  channels.isLoading
+                    ? "Loading channels…"
+                    : channels.isError
+                      ? "Failed to load channels"
+                      : "Select a channel…"
+                }
+                emptyLabel="No channels found"
+                options={channelList.map((ch) => ({
+                  value: ch.id,
+                  searchText: `${ch.isPrivate ? "🔒 " : "#"}${ch.name}`,
+                  label: (
+                    <span className="flex items-center gap-1.5">
+                      <span className="text-subtle">{ch.isPrivate ? "🔒" : "#"}</span>
+                      <span>{ch.name}</span>
+                    </span>
+                  ),
+                }))}
+              />
+            </div>
+            <Btn
+              size="sm"
+              variant="primary"
+              disabled={!projectId || !dirty || setRoute.isPending}
+              loading={setRoute.isPending}
+              onClick={async () => {
+                const ch = channelList.find((c) => c.id === pendingChannelId);
+                if (!ch) return;
+                await setRoute.mutateAsync(ch);
+              }}
+            >
+              {configured ? "Update" : "Enable"}
+            </Btn>
+          </>
+        }
+      />
+    </SettingsCard>
   );
 }
 
@@ -1353,35 +1305,27 @@ function WeeklyDigestCard() {
     : "Never sent";
 
   return (
-    <Tile>
-      <div className="space-y-4">
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            {enabled && channelId ? (
-              <Chip tone="success" dot>
-                Posting weekly to #{channelName ?? channelId}
-              </Chip>
-            ) : (
-              <Chip tone="muted" dot>
-                Disabled
-              </Chip>
-            )}
-            <p className="mt-2 text-[12px] text-muted">{lastRunLabel}</p>
-          </div>
-          <label className="flex cursor-pointer items-center gap-2 text-[13px] text-muted">
-            <input
-              type="checkbox"
-              checked={enabled}
-              disabled={save.isPending || (!enabled && !channelId)}
-              onChange={(e) => save.mutate({ enabled: e.target.checked })}
-            />
-            Enabled
-          </label>
-        </div>
-
-        <div className="flex flex-wrap items-end gap-3">
-          <div className="min-w-[260px] flex-1">
-            <FieldLabel>Channel</FieldLabel>
+    <SettingsCard>
+      <SettingsRow
+        title="Post a weekly recap to Slack"
+        description={
+          enabled && channelId
+            ? `Posting to #${channelName ?? channelId} · ${lastRunLabel}`
+            : lastRunLabel
+        }
+        control={
+          <Toggle
+            checked={enabled}
+            disabled={save.isPending || (!enabled && !channelId)}
+            onChange={(v) => save.mutate({ enabled: v })}
+          />
+        }
+      />
+      <SettingsRow
+        title="Channel"
+        description="Use a different channel from incident threads if it's noisy — invite the bot to private channels"
+        control={
+          <div className="w-60">
             <Dropdown
               value={channelId}
               disabled={channels.isLoading || channels.isError || save.isPending}
@@ -1416,24 +1360,24 @@ function WeeklyDigestCard() {
               ]}
             />
           </div>
+        }
+      />
+      <SettingsRow
+        title="Send digest now"
+        description="An LLM ranks the open bug-fix PRs across this org and posts the top 3"
+        control={
           <Btn
-            size="md"
+            size="sm"
             variant="secondary"
             disabled={!channelId || runNow.isPending}
             loading={runNow.isPending}
             onClick={() => runNow.mutate()}
           >
-            Send digest now
+            Send now
           </Btn>
-        </div>
-
-        <p className="text-[12px] text-muted">
-          Each week, an LLM ranks the open bug-fix PRs the agent has produced across this org and
-          posts the top 3. Use a different channel from incident threads if it's noisy. Same Slack
-          install — invite the bot to private channels you want to use.
-        </p>
-      </div>
-    </Tile>
+        }
+      />
+    </SettingsCard>
   );
 }
 
@@ -1494,6 +1438,413 @@ function LinearCard() {
   );
 }
 
+function awsStatusChip(c?: CloudConnection) {
+  if (!c)
+    return (
+      <Chip tone="muted" dot>
+        Not connected
+      </Chip>
+    );
+  switch (c.status) {
+    case "connected":
+      return (
+        <Chip tone="success" dot>
+          Connected · {c.accountId} · {c.region}
+        </Chip>
+      );
+    case "pending":
+      return (
+        <Chip tone="warning" dot>
+          Awaiting stack deploy
+        </Chip>
+      );
+    case "account_mismatch":
+      return (
+        <Chip tone="danger" dot>
+          Account mismatch
+        </Chip>
+      );
+    case "failed":
+      return (
+        <Chip tone="danger" dot>
+          Verification failed
+        </Chip>
+      );
+  }
+}
+
+// Commercial AWS regions. Metric streams / Firehose are regional, so the
+// connection targets one region (multi-region = multiple connections later).
+const AWS_REGIONS: ReadonlyArray<{ code: string; name: string }> = [
+  { code: "us-east-1", name: "US East (N. Virginia)" },
+  { code: "us-east-2", name: "US East (Ohio)" },
+  { code: "us-west-1", name: "US West (N. California)" },
+  { code: "us-west-2", name: "US West (Oregon)" },
+  { code: "ca-central-1", name: "Canada (Central)" },
+  { code: "ca-west-1", name: "Canada West (Calgary)" },
+  { code: "eu-west-1", name: "Europe (Ireland)" },
+  { code: "eu-west-2", name: "Europe (London)" },
+  { code: "eu-west-3", name: "Europe (Paris)" },
+  { code: "eu-central-1", name: "Europe (Frankfurt)" },
+  { code: "eu-central-2", name: "Europe (Zurich)" },
+  { code: "eu-north-1", name: "Europe (Stockholm)" },
+  { code: "eu-south-1", name: "Europe (Milan)" },
+  { code: "eu-south-2", name: "Europe (Spain)" },
+  { code: "ap-south-1", name: "Asia Pacific (Mumbai)" },
+  { code: "ap-south-2", name: "Asia Pacific (Hyderabad)" },
+  { code: "ap-southeast-1", name: "Asia Pacific (Singapore)" },
+  { code: "ap-southeast-2", name: "Asia Pacific (Sydney)" },
+  { code: "ap-southeast-3", name: "Asia Pacific (Jakarta)" },
+  { code: "ap-southeast-4", name: "Asia Pacific (Melbourne)" },
+  { code: "ap-southeast-5", name: "Asia Pacific (Malaysia)" },
+  { code: "ap-southeast-7", name: "Asia Pacific (Thailand)" },
+  { code: "ap-northeast-1", name: "Asia Pacific (Tokyo)" },
+  { code: "ap-northeast-2", name: "Asia Pacific (Seoul)" },
+  { code: "ap-northeast-3", name: "Asia Pacific (Osaka)" },
+  { code: "ap-east-1", name: "Asia Pacific (Hong Kong)" },
+  { code: "ap-east-2", name: "Asia Pacific (Taipei)" },
+  { code: "sa-east-1", name: "South America (São Paulo)" },
+  { code: "mx-central-1", name: "Mexico (Central)" },
+  { code: "me-south-1", name: "Middle East (Bahrain)" },
+  { code: "me-central-1", name: "Middle East (UAE)" },
+  { code: "il-central-1", name: "Israel (Tel Aviv)" },
+  { code: "af-south-1", name: "Africa (Cape Town)" },
+];
+
+const AWS_REGION_OPTIONS = AWS_REGIONS.map((r) => ({
+  value: r.code,
+  label: (
+    <span>
+      <span className="font-mono">{r.code}</span>
+      <span className="text-muted"> · {r.name}</span>
+    </span>
+  ),
+  searchText: `${r.code} ${r.name}`,
+}));
+
+// Per-project ingest source toggles. Lets you turn a telemetry source (SDK/OTLP
+// or AWS CloudWatch) on/off per signal; the proxy ack-drops disabled telemetry
+// at the edge so it's never stored or billed. Useful to e.g. keep AWS metrics
+// but stop a noisy AWS log stream without tearing down the CloudFormation stack.
+function IngestSourceRow({
+  title,
+  hint,
+  signals,
+  state,
+  disabled,
+  onToggle,
+}: {
+  title: string;
+  hint: string;
+  signals: ReadonlyArray<{ key: string; label: string }>;
+  state: Record<string, boolean>;
+  disabled: boolean;
+  onToggle: (signal: string, next: boolean) => void;
+}) {
+  return (
+    <div className="rounded-md border border-subtle p-3">
+      <div className="text-[13px] font-medium">{title}</div>
+      <div className="mb-2 text-[12px] text-muted">{hint}</div>
+      <div className="flex flex-wrap gap-x-5 gap-y-2">
+        {signals.map((s) => (
+          <label key={s.key} className="flex items-center gap-2 text-[13px]">
+            <Toggle
+              checked={state[s.key] ?? true}
+              onChange={(next) => onToggle(s.key, next)}
+              disabled={disabled}
+            />
+            <span className={state[s.key] === false ? "text-muted" : ""}>{s.label}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function IngestSourcesCard({ projectId }: { projectId: string | undefined }) {
+  const filters = useIngestFilters(projectId);
+  const setFilters = useSetIngestFilters(projectId ?? "");
+  const state = filters.data;
+
+  const setSignal = (source: "otlp" | "aws", signal: string, next: boolean) => {
+    if (!state) return;
+    const updated: IngestFilterState = {
+      ...state,
+      [source]: { ...state[source], [signal]: next },
+    };
+    setFilters.mutate(updated);
+  };
+
+  return (
+    <Tile label="Ingestion">
+      <div className="space-y-3">
+        <p className="text-[13px] text-muted">
+          Choose which telemetry this project ingests. Anything turned off is dropped at the edge —
+          never stored or billed.
+        </p>
+        {!state ? (
+          <p className="text-[13px] text-muted">Loading…</p>
+        ) : (
+          <div className="space-y-2">
+            <IngestSourceRow
+              title="SDK / OTLP"
+              hint="Telemetry from your apps' OpenTelemetry exporters."
+              signals={[
+                { key: "traces", label: "Traces" },
+                { key: "logs", label: "Logs" },
+                { key: "metrics", label: "Metrics" },
+              ]}
+              state={state.otlp}
+              disabled={setFilters.isPending}
+              onToggle={(signal, next) => setSignal("otlp", signal, next)}
+            />
+            <IngestSourceRow
+              title="AWS CloudWatch"
+              hint="Metric streams + account logs delivered via the connected AWS stack."
+              signals={[
+                { key: "logs", label: "Logs" },
+                { key: "metrics", label: "Metrics" },
+              ]}
+              state={state.aws}
+              disabled={setFilters.isPending}
+              onToggle={(signal, next) => setSignal("aws", signal, next)}
+            />
+          </div>
+        )}
+      </div>
+    </Tile>
+  );
+}
+
+function AwsCard({ projectId }: { projectId: string | undefined }) {
+  const connections = useCloudConnections(projectId);
+  const create = useCreateCloudConnection(projectId ?? "");
+  const verify = useVerifyCloudConnection(projectId ?? "");
+  const del = useDeleteCloudConnection(projectId ?? "");
+
+  const [region, setRegion] = useState("us-west-2");
+  // The launch URL + external id are only returned once, at create time — keep
+  // them in memory to drive the "deploy then paste the ARN" step.
+  const [created, setCreated] = useState<{ id: string; launchUrl: string } | null>(null);
+  const [roleArn, setRoleArn] = useState("");
+
+  const list = connections.data ?? [];
+  const active = list.find((c) => c.status === "connected") ?? list[0];
+  // The connection we're mid-setup on: just created, or an existing un-verified row.
+  const setupTarget = active && active.status !== "connected" ? active : undefined;
+
+  return (
+    <Tile label="AWS">
+      <div className="space-y-3">
+        <p className="text-[13px] text-muted">
+          Connect your AWS account to inventory resources and stream CloudWatch metrics. Deploys a
+          read-only IAM role you control via CloudFormation — revoke any time.
+        </p>
+
+        <div>{awsStatusChip(active)}</div>
+
+        {active?.status === "connected" ? (
+          <div className="space-y-3">
+            <AwsStackHealthPanel
+              projectId={projectId}
+              connectionId={active.id}
+              region={active.region}
+            />
+            <Btn
+              size="sm"
+              variant="danger"
+              loading={del.isPending}
+              onClick={() => del.mutate(active.id)}
+            >
+              Disconnect
+            </Btn>
+          </div>
+        ) : setupTarget || created ? (
+          <div className="space-y-2">
+            {created && (
+              <Btn
+                size="sm"
+                variant="primary"
+                onClick={() => window.open(created.launchUrl, "_blank", "noopener")}
+              >
+                Launch CloudFormation stack
+              </Btn>
+            )}
+            {created && (
+              <p className="text-[12px] text-muted">
+                After you create the stack it connects automatically — this updates on its own. Or
+                paste the Role ARN from the stack's Outputs below.
+              </p>
+            )}
+            <FieldLabel>Role ARN (from the stack's Outputs)</FieldLabel>
+            <Input
+              value={roleArn}
+              onChange={(e) => setRoleArn(e.target.value)}
+              placeholder="arn:aws:iam::123456789012:role/SuperlogScrapeRole"
+            />
+            {setupTarget &&
+              (setupTarget.status === "failed" || setupTarget.status === "account_mismatch") && (
+                <p className="text-[12px] text-danger">
+                  {setupTarget.lastError ??
+                    "Couldn't assume the role — confirm the stack deployed and the ARN is correct."}
+                </p>
+              )}
+            <div className="flex items-center gap-2">
+              <Btn
+                size="sm"
+                variant="primary"
+                loading={verify.isPending}
+                disabled={!roleArn.trim()}
+                onClick={async () => {
+                  const id = created?.id ?? setupTarget?.id;
+                  if (!id) return;
+                  const res = await verify.mutateAsync({
+                    id,
+                    scrapeRoleArn: roleArn.trim(),
+                  });
+                  if (res.status === "connected") {
+                    setCreated(null);
+                    setRoleArn("");
+                  }
+                }}
+              >
+                Verify connection
+              </Btn>
+              <Btn
+                size="sm"
+                variant="ghost"
+                loading={del.isPending}
+                onClick={() => {
+                  const id = created?.id ?? setupTarget?.id;
+                  setCreated(null);
+                  setRoleArn("");
+                  if (id) del.mutate(id);
+                }}
+              >
+                Cancel
+              </Btn>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <FieldLabel>Region</FieldLabel>
+            <Dropdown
+              value={region}
+              onChange={setRegion}
+              options={AWS_REGION_OPTIONS}
+              placeholder="Select a region…"
+            />
+            <Btn
+              size="sm"
+              variant="primary"
+              loading={create.isPending}
+              disabled={!projectId || !region.trim()}
+              onClick={async () => {
+                const res = await create.mutateAsync({ region: region.trim() });
+                setCreated({ id: res.id, launchUrl: res.launchUrl });
+              }}
+            >
+              Connect AWS
+            </Btn>
+          </div>
+        )}
+      </div>
+    </Tile>
+  );
+}
+
+// Dot color per reconciliation state.
+const STACK_STATE_DOT: Record<StackComponent["state"], string> = {
+  working: "bg-success",
+  pending: "bg-warning",
+  broken: "bg-danger",
+  missing: "bg-subtle",
+};
+
+// Reconciliation checklist for a connected AWS account: each piece of the stack
+// (connection / metric streaming / log streaming) shown as in-place, missing,
+// working, or broken, with a per-row action to drive it to a working state.
+// State comes from the connection's verify status + the stream keys' delivery
+// signal; "Set up"/"Re-launch" opens the (idempotent) CloudFormation stack.
+function AwsStackHealthPanel({
+  projectId,
+  connectionId,
+  region,
+}: {
+  projectId: string | undefined;
+  connectionId: string;
+  region: string;
+}) {
+  const health = useCloudStackHealth(projectId, connectionId, true);
+  const setup = useSetupCloudStream(projectId ?? "");
+
+  const components = health.data?.components ?? [];
+  const working = components.filter((c) => c.state === "working").length;
+
+  // Streams carry a last-received time we append; the connection row doesn't.
+  const detailLine = (c: StackComponent) =>
+    c.lastReceivedAt ? `${c.detail} · last received ${formatRelative(c.lastReceivedAt)}` : c.detail;
+
+  return (
+    <div className="space-y-2 rounded-md border border-subtle/40 p-3">
+      <div className="flex items-center justify-between">
+        <div className="text-[12px] font-medium">Integration stack · {region}</div>
+        {components.length > 0 && (
+          <div className="text-[11px] text-subtle">
+            {working}/{components.length} working
+          </div>
+        )}
+      </div>
+
+      {components.map((c) => {
+        const isStream = c.key === "metrics" || c.key === "logs";
+        const action = isStream
+          ? c.state === "missing"
+            ? { label: "Set up", variant: "primary" as const }
+            : { label: "Re-launch", variant: "ghost" as const }
+          : null;
+        return (
+          <div key={c.key} className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 text-[13px]">
+                <span
+                  className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${STACK_STATE_DOT[c.state]}`}
+                />
+                {c.label}
+              </div>
+              <div className={`text-[12px] ${c.state === "broken" ? "text-danger" : "text-muted"}`}>
+                {detailLine(c)}
+              </div>
+            </div>
+            {action && (
+              <Btn
+                size="sm"
+                variant={action.variant}
+                loading={setup.isPending && setup.variables?.kind === c.key}
+                onClick={async () => {
+                  const res = await setup.mutateAsync({
+                    connectionId,
+                    kind: c.key as "metrics" | "logs",
+                  });
+                  window.open(res.launchUrl, "_blank", "noopener");
+                }}
+              >
+                {action.label}
+              </Btn>
+            )}
+          </div>
+        );
+      })}
+
+      <p className="text-[11px] text-subtle">
+        Streaming runs in your AWS account (CloudWatch → Firehose); costs are billed to you.
+        “Re-launch” re-opens the same CloudFormation stack — safe to re-run — to repair it, change
+        namespaces, or tear it down.
+      </p>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Agent flowchart
 // ---------------------------------------------------------------------------
@@ -1527,7 +1878,7 @@ function OrgGuidanceCard() {
           onChange={(e) => setDraft(e.target.value.slice(0, ORG_GUIDANCE_MAX_LEN))}
           rows={5}
           placeholder="e.g. Always link incidents to the on-call runbook before filing a ticket. Prefer reverts over forward fixes for prod regressions."
-          className="w-full rounded-sm border border-border bg-surface-2 p-3 font-mono text-[12.5px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
+          className="w-full rounded-lg border border-border bg-surface-2 p-3 font-mono text-[12.5px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
         />
         <div className="flex items-center justify-between text-[12px] text-muted">
           <span>Prepended to every agent run prompt across all projects in this org.</span>
@@ -2014,7 +2365,7 @@ function IssueFilterBucket({
         <FieldLabel>{meta.label}</FieldLabel>
         <p className="mt-0.5 text-[12px] text-subtle">{meta.subtitle}</p>
       </div>
-      <div className="relative flex min-h-[40px] flex-wrap items-center gap-2 rounded-sm border border-border bg-surface-2 p-2">
+      <div className="relative flex min-h-[40px] flex-wrap items-center gap-2 rounded-lg border border-border bg-surface-2 p-2">
         {clauses.length === 0 && (
           <span className="px-1 text-[12.5px] text-subtle">
             {meta.mode === "include" ? "Any" : "Nothing"} — no constraint.
@@ -2186,7 +2537,7 @@ function IssueFilterPicker({
               }
             }}
             autoFocus
-            className="h-7 w-full rounded-sm border border-border bg-surface-2 px-2 text-[12px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none"
+            className="h-7 w-full rounded-lg border border-border bg-surface-2 px-2 text-[12px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none"
           />
         </div>
         <div className="max-h-72 overflow-y-auto">
@@ -2255,7 +2606,7 @@ function IssueFilterPicker({
             }
           }}
           autoFocus
-          className="h-7 w-full rounded-sm border border-border bg-surface-2 px-2 text-[12px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none"
+          className="h-7 w-full rounded-lg border border-border bg-surface-2 px-2 text-[12px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none"
         />
       </div>
       <div className="max-h-72 overflow-y-auto">
@@ -2667,7 +3018,7 @@ function InstructionsField({
         placeholder={
           "e.g. Prefer one-line fixes when possible. When patching the billing service, run pnpm typecheck before declaring the patch validated."
         }
-        className="w-full rounded-sm border border-border bg-surface-2 p-3 font-mono text-[12.5px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
+        className="w-full rounded-lg border border-border bg-surface-2 p-3 font-mono text-[12.5px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
       />
       <div className="flex items-center justify-between text-[12px] text-muted">
         <span>Appended to every agent run prompt for this workspace.</span>
@@ -2869,7 +3220,7 @@ function InstructionForm({
         onChange={(e) => onTextChange(e.target.value)}
         rows={3}
         placeholder="Describe the requirement the agent must follow when filing this ticket…"
-        className="w-full rounded-sm border border-border bg-surface-1 p-2 font-mono text-[12px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
+        className="w-full rounded-lg border border-border bg-surface-1 p-2 font-mono text-[12px] text-fg placeholder:text-subtle focus:border-border-strong focus:outline-none disabled:opacity-60"
       />
       <div className="flex items-center gap-2">
         <Btn size="sm" variant="primary" disabled={!title.trim() || disabled} onClick={onSave}>
@@ -3162,6 +3513,7 @@ function ApiKeysCard({ projectId }: { projectId: string | undefined }) {
             <div className="mb-1 flex items-center justify-between">
               <Label>Copy this now — it will not be shown again</Label>
               <button
+                type="button"
                 onClick={() => setReveal(null)}
                 className="text-[11px] text-muted hover:text-fg"
               >
@@ -3243,6 +3595,183 @@ function ApiKeysCard({ projectId }: { projectId: string | undefined }) {
   );
 }
 
+const MCP_EXPIRY_OPTIONS: DropdownOption[] = [
+  { value: "never", label: "Never" },
+  { value: "30d", label: "30 days" },
+  { value: "90d", label: "90 days" },
+];
+
+function McpTokensCard({ projectId }: { projectId: string | undefined }) {
+  const tokens = useMcpTokens();
+  const projectsQ = useOrgProjects();
+  const create = useCreateMcpToken();
+  const revoke = useRevokeMcpToken();
+
+  const projects = projectsQ.data?.projects ?? [];
+  const [name, setName] = useState("");
+  const [selectedProject, setSelectedProject] = useState<string>("");
+  const [expiry, setExpiry] = useState<"never" | "30d" | "90d">("never");
+  const [reveal, setReveal] = useState<{ plaintext: string } | null>(null);
+
+  // Default the project picker to the section's active project once known.
+  useEffect(() => {
+    if (!selectedProject && projectId) setSelectedProject(projectId);
+  }, [projectId, selectedProject]);
+
+  const projectOptions: DropdownOption[] = projects.map((p) => ({ value: p.id, label: p.name }));
+  const effectiveProject = selectedProject || projectId || projects[0]?.id || "";
+
+  const live = useMemo(
+    () => (tokens.data?.tokens ?? []).filter((t) => !t.revokedAt),
+    [tokens.data],
+  );
+
+  return (
+    <Tile>
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="min-w-[180px] flex-1">
+            <FieldLabel>Token name</FieldLabel>
+            <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="my-laptop" />
+          </div>
+          <div className="w-44">
+            <FieldLabel>Default project</FieldLabel>
+            <Dropdown
+              value={effectiveProject}
+              onChange={setSelectedProject}
+              options={projectOptions}
+              placeholder="Select…"
+            />
+          </div>
+          <div className="w-32">
+            <FieldLabel>Expires</FieldLabel>
+            <Dropdown
+              value={expiry}
+              onChange={(v) => setExpiry(v as "never" | "30d" | "90d")}
+              options={MCP_EXPIRY_OPTIONS}
+            />
+          </div>
+          <Btn
+            size="md"
+            variant="primary"
+            disabled={!effectiveProject || create.isPending}
+            loading={create.isPending}
+            onClick={async () => {
+              if (!effectiveProject) return;
+              const res = await create.mutateAsync({
+                name: name.trim() || "MCP token",
+                projectId: effectiveProject,
+                expiry,
+              });
+              setReveal({ plaintext: res.token.plaintext });
+              setName("");
+            }}
+          >
+            Create token
+          </Btn>
+        </div>
+
+        {reveal && (
+          <div className="rounded-sm border border-accent/40 bg-accent-soft/30 p-3">
+            <div className="mb-1 flex items-center justify-between">
+              <Label>Copy this now — it will not be shown again</Label>
+              <button
+                type="button"
+                onClick={() => setReveal(null)}
+                className="text-[11px] text-muted hover:text-fg"
+              >
+                dismiss
+              </button>
+            </div>
+            <code className="block break-all font-mono text-[12.5px] text-fg">
+              {reveal.plaintext}
+            </code>
+            <p className="mt-2 text-[12px] text-muted">Add it to your agent, for example:</p>
+            <code className="mt-1 block break-all font-mono text-[12px] text-subtle">
+              claude mcp add --transport http superlog https://api.superlog.sh/mcp --header
+              "Authorization: Bearer {reveal.plaintext}"
+            </code>
+          </div>
+        )}
+
+        <div className="border-t border-border">
+          {tokens.isLoading ? (
+            <div className="py-6 text-center text-[12px] text-muted">Loading…</div>
+          ) : live.length === 0 ? (
+            <div className="py-6 text-center text-[12px] text-muted">
+              No active MCP tokens. Create one above, or connect via the browser OAuth flow instead.
+            </div>
+          ) : (
+            <table className="w-full text-[13px]">
+              <thead>
+                <tr className="border-b border-border text-left text-muted">
+                  <th className="py-2 pr-4 font-mono text-[10px] uppercase tracking-[0.2em]">
+                    Name
+                  </th>
+                  <th className="py-2 pr-4 font-mono text-[10px] uppercase tracking-[0.2em]">
+                    Project
+                  </th>
+                  <th className="py-2 pr-4 font-mono text-[10px] uppercase tracking-[0.2em]">
+                    Expires
+                  </th>
+                  <th className="py-2 pr-4 font-mono text-[10px] uppercase tracking-[0.2em]">
+                    Last used
+                  </th>
+                  <th className="py-2 font-mono text-[10px] uppercase tracking-[0.2em]" />
+                </tr>
+              </thead>
+              <tbody>
+                {live.map((t) => (
+                  <tr key={t.id} className="border-b border-border last:border-0">
+                    <td className="py-3 pr-4">
+                      <div>{t.name}</div>
+                      <div className="font-mono text-[11px] text-muted">{t.tokenPrefix}…</div>
+                    </td>
+                    <td className="py-3 pr-4 text-muted">{t.projectName ?? "—"}</td>
+                    <td className="py-3 pr-4 text-muted">
+                      {t.expiresAt ? new Date(t.expiresAt).toLocaleDateString() : "never"}
+                    </td>
+                    <td className="py-3 pr-4 text-muted">
+                      {t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString() : "never"}
+                    </td>
+                    <td className="py-3 text-right">
+                      <button
+                        type="button"
+                        title="Revoke token"
+                        aria-label="Revoke token"
+                        disabled={revoke.isPending}
+                        onClick={() => revoke.mutate(t.id)}
+                        className="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted transition-colors hover:bg-danger/10 hover:text-danger disabled:opacity-40"
+                      >
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          aria-hidden
+                        >
+                          <path d="M3 6h18" />
+                          <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                          <path d="M19 6 18 20a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                          <path d="M10 11v6M14 11v6" />
+                        </svg>
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    </Tile>
+  );
+}
+
 function OrgApiKeysCard() {
   const list = useOrgApiKeys();
   const mint = useMintOrgApiKey();
@@ -3284,6 +3813,7 @@ function OrgApiKeysCard() {
             <div className="mb-1 flex items-center justify-between">
               <Label>Copy this now — it will not be shown again</Label>
               <button
+                type="button"
                 onClick={() => setReveal(null)}
                 className="text-[11px] text-muted hover:text-fg"
               >

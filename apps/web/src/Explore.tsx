@@ -14,8 +14,8 @@ import {
 } from "recharts";
 import { LogDrawer } from "./LogDetail.tsx";
 import { TraceDrawer } from "./TraceDetail.tsx";
-import { addAttrFilter } from "./exploreAttrFilter.ts";
 import {
+  type CloudResourceRow,
   type ExploreFilter,
   type ExploreRange,
   type LogRow,
@@ -27,6 +27,8 @@ import {
   type ResourceAttr,
   type SeriesRow,
   type TraceAggregatedRow,
+  useCloudConnections,
+  useCloudResources,
   useExploreAttributeKeys,
   useExploreAttributeValues,
   useExploreLogs,
@@ -37,7 +39,9 @@ import {
   useExploreTraces,
   useExploreTracesAggregated,
   useMe,
+  useSyncCloudConnection,
 } from "./api.ts";
+import { Dropdown } from "./design/Dropdown.tsx";
 import {
   RANGE_PRESETS,
   RangePicker,
@@ -46,6 +50,7 @@ import {
 } from "./design/RangePicker.tsx";
 import { ScrollArea } from "./design/scroll-area.tsx";
 import { Btn, Chip, Input, Label, ShortcutKey, Tile } from "./design/ui.tsx";
+import { addAttrFilter } from "./exploreAttrFilter.ts";
 import { tracer } from "./instrumentation.ts";
 import { formatLocalHm, formatLocalTimestamp, formatLocalTimestampMs } from "./timeFormat.ts";
 
@@ -83,12 +88,12 @@ export function Explore() {
   return <ExploreInner projectId={me.data.project.id} />;
 }
 
-export type Source = "logs" | "traces" | "metrics";
+export type Source = "logs" | "traces" | "metrics" | "resources";
 export type TracesView = "spans" | "traces";
 
 function sourceFromPath(pathname: string): Source | null {
   const seg = pathname.replace(/^\/explore\/?/, "").split("/")[0];
-  if (seg === "logs" || seg === "traces" || seg === "metrics") return seg;
+  if (seg === "logs" || seg === "traces" || seg === "metrics" || seg === "resources") return seg;
   return null;
 }
 
@@ -280,28 +285,33 @@ function ExploreInner({ projectId }: { projectId: string }) {
     <div className="flex flex-col gap-6">
       <section className="flex flex-wrap items-center justify-between gap-4">
         <ExploreTabs />
-        <RangePicker
-          value={selection}
-          range={range}
-          onChange={(next) => {
-            const span = tracer.startSpan("explore.range_change", {
-              attributes: {
-                "explore.source": source,
-                "explore.range_label": next.label,
-                "explore.attr_count": attrs.length,
-              },
-            });
-            try {
-              setSelection(next);
-              setNowTick(Date.now());
-            } finally {
-              span.end();
-            }
-          }}
-        />
+        {/* Resources are inventory, not time-ranged telemetry — no range picker. */}
+        {source !== "resources" && (
+          <RangePicker
+            value={selection}
+            range={range}
+            onChange={(next) => {
+              const span = tracer.startSpan("explore.range_change", {
+                attributes: {
+                  "explore.source": source,
+                  "explore.range_label": next.label,
+                  "explore.attr_count": attrs.length,
+                },
+              });
+              try {
+                setSelection(next);
+                setNowTick(Date.now());
+              } finally {
+                span.end();
+              }
+            }}
+          />
+        )}
       </section>
 
-      {source === "metrics" ? (
+      {source === "resources" ? (
+        <ResourcesPanel projectId={projectId} />
+      ) : source === "metrics" ? (
         <>
           <MetricNamePicker
             projectId={projectId}
@@ -415,11 +425,155 @@ function ExploreInner({ projectId }: { projectId: string }) {
 // ---------------------------------------------------------------------------
 // ExploreTabs — logs · traces · metrics subpages
 // ---------------------------------------------------------------------------
+// ResourcesPanel — inventory of AWS resources discovered for the project.
+
+function ResourcesPanel({ projectId }: { projectId: string }) {
+  const resources = useCloudResources(projectId);
+  const connections = useCloudConnections(projectId);
+  const sync = useSyncCloudConnection(projectId);
+
+  const [search, setSearch] = useState("");
+  const [service, setService] = useState("");
+  const [region, setRegion] = useState("");
+
+  const rows = useMemo(() => resources.data ?? [], [resources.data]);
+  const connected = (connections.data ?? []).find((c) => c.status === "connected");
+
+  const services = useMemo(() => Array.from(new Set(rows.map((r) => r.service))).sort(), [rows]);
+  const regions = useMemo(
+    () => Array.from(new Set(rows.map((r) => r.region).filter((r): r is string => !!r))).sort(),
+    [rows],
+  );
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return rows.filter((r) => {
+      if (service && r.service !== service) return false;
+      if (region && r.region !== region) return false;
+      if (!q) return true;
+      return (
+        (r.name?.toLowerCase().includes(q) ?? false) ||
+        r.arn.toLowerCase().includes(q) ||
+        r.service.toLowerCase().includes(q)
+      );
+    });
+  }, [rows, search, service, region]);
+
+  // Empty state: no connection yet → point at Settings.
+  if (!resources.isLoading && rows.length === 0 && !connected) {
+    return (
+      <Tile>
+        <div className="space-y-3 py-6 text-center">
+          <p className="text-[13px] text-muted">
+            No AWS account connected yet. Connect one to inventory your resources.
+          </p>
+          <NavLink
+            to="/settings?scope=project&section=integrations"
+            className="inline-block rounded-sm bg-accent px-3 py-1.5 text-[13px] font-medium text-bg"
+          >
+            Connect AWS
+          </NavLink>
+        </div>
+      </Tile>
+    );
+  }
+
+  return (
+    <Tile padded={false}>
+      <div className="flex flex-wrap items-center gap-3 border-b border-border px-5 py-3">
+        <Input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search name, ARN, or service…"
+          className="max-w-xs"
+        />
+        <Dropdown
+          value={service}
+          onChange={setService}
+          options={[
+            { value: "", label: "All services" },
+            ...services.map((s) => ({ value: s, label: s })),
+          ]}
+          searchable={services.length > 8}
+        />
+        <Dropdown
+          value={region}
+          onChange={setRegion}
+          options={[
+            { value: "", label: "All regions" },
+            ...regions.map((r) => ({ value: r, label: r })),
+          ]}
+          searchable={regions.length > 8}
+        />
+        <div className="ml-auto flex items-center gap-3">
+          <span className="font-mono text-[11px] text-subtle">
+            {filtered.length} of {rows.length}
+          </span>
+          {connected && (
+            <Btn
+              size="sm"
+              variant="secondary"
+              loading={sync.isPending}
+              onClick={() => sync.mutate(connected.id)}
+            >
+              Sync now
+            </Btn>
+          )}
+        </div>
+      </div>
+
+      <div className="overflow-auto">
+        {filtered.length === 0 ? (
+          <div className="px-5 py-8 text-center font-mono text-[11px] text-subtle">
+            {resources.isLoading ? "loading…" : "no resources"}
+          </div>
+        ) : (
+          <table className="w-full border-collapse font-mono text-[12px]">
+            <thead>
+              <tr className="text-left text-subtle">
+                <th className="px-5 py-2 font-normal">name</th>
+                <th className="px-5 py-2 font-normal">service</th>
+                <th className="px-5 py-2 font-normal">type</th>
+                <th className="px-5 py-2 font-normal">region</th>
+                <th className="px-5 py-2 font-normal">tags</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((r) => (
+                <ResourceRow key={r.id} r={r} />
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </Tile>
+  );
+}
+
+function ResourceRow({ r }: { r: CloudResourceRow }) {
+  const tagCount = r.tags ? Object.keys(r.tags).length : 0;
+  return (
+    <tr className="border-t border-border align-top">
+      <td className="px-5 py-2 text-fg" title={r.arn}>
+        <span className="line-clamp-1 break-all">{r.name ?? r.arn}</span>
+      </td>
+      <td className="whitespace-nowrap px-5 py-2">
+        <Chip tone="accent">{r.service}</Chip>
+      </td>
+      <td className="whitespace-nowrap px-5 py-2 text-muted">{r.resourceType ?? "—"}</td>
+      <td className="whitespace-nowrap px-5 py-2 text-muted">{r.region ?? "—"}</td>
+      <td className="px-5 py-2 text-subtle">{tagCount > 0 ? `${tagCount} tag(s)` : "—"}</td>
+    </tr>
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 const TABS: { source: Source; label: string }[] = [
   { source: "logs", label: "Logs" },
   { source: "traces", label: "Traces" },
   { source: "metrics", label: "Metrics" },
+  { source: "resources", label: "Resources" },
 ];
 
 export function ExploreTabs() {
@@ -1059,12 +1213,13 @@ export function AddFilter({
     searchInputRef.current?.focus();
   }, [drill?.kind, drill?.kind === "attr" ? drill.key : null]);
 
-  const keys = useExploreAttributeKeys(projectId, range, source);
+  const attrSource = source === "resources" ? undefined : source;
+  const keys = useExploreAttributeKeys(projectId, range, attrSource);
   const values = useExploreAttributeValues(
     projectId,
     drill?.kind === "attr" ? drill.key : undefined,
     range,
-    source,
+    attrSource,
   );
 
   const existingPairs = useMemo(
@@ -1574,7 +1729,11 @@ export function GroupBySelect({
   // Pass `""` to render just the selected value without a "Group by:" prefix.
   triggerLabel?: string;
 }) {
-  const keys = useExploreAttributeKeys(projectId, range, source);
+  const keys = useExploreAttributeKeys(
+    projectId,
+    range,
+    source === "resources" ? undefined : source,
+  );
   const options = useMemo<KeyboardSelectOption[]>(() => {
     const out: KeyboardSelectOption[] = [
       { value: "", label: "none" },

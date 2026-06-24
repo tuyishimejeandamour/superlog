@@ -73,14 +73,21 @@ function attrConds(
   attrs.forEach((a, i) => {
     const kName = `${paramPrefix}_k_${i}`;
     const vName = `${paramPrefix}_v_${i}`;
+    // service.name lives in the dedicated ServiceName column, which leads
+    // every otel table's primary key — filter it natively so ClickHouse can
+    // prune to the service's PK range instead of scanning the resource map
+    // for the whole window. (The collector populates ServiceName from the
+    // service.name resource attribute, so the two are equivalent.)
+    const native = column === "ResourceAttributes" && a.key === "service.name";
+    const target = native ? "ServiceName" : `${column}[{${kName}:String}]`;
     if (a.op === "neq") {
-      conds.push(`${column}[{${kName}:String}] != {${vName}:String}`);
+      conds.push(`${target} != {${vName}:String}`);
     } else if (a.op === "not_contains") {
-      conds.push(`positionCaseInsensitive(${column}[{${kName}:String}], {${vName}:String}) = 0`);
+      conds.push(`positionCaseInsensitive(${target}, {${vName}:String}) = 0`);
     } else {
-      conds.push(`${column}[{${kName}:String}] = {${vName}:String}`);
+      conds.push(`${target} = {${vName}:String}`);
     }
-    params[kName] = a.key;
+    if (!native) params[kName] = a.key;
     params[vName] = a.value;
   });
   return { conds, params };
@@ -1122,6 +1129,128 @@ export function pickStep(rangeSeconds: number, targetBuckets = 120): Step {
   return STEP_LADDER[STEP_LADDER.length - 1] ?? { n: 1, unit: "DAY" };
 }
 
+// -----------------------------------------------------------------------------
+// events_per_minute rollup fast path. Count widgets over long ranges were
+// scanning the raw tables (and the ResourceAttributes map) for every row in
+// the window, which times out for high-volume projects. Queries the rollup
+// (see infra/clickhouse/migrations/003_events_per_minute.sql) can answer —
+// minute-or-coarser buckets, filters within (service, severity, status_code),
+// grouping by nothing or service — read it instead.
+//
+// Availability is probed once per client and memoized so deployments without
+// the rollup (it is not part of the collector's auto-created schema) fall
+// back to the raw scan without a per-request penalty.
+// -----------------------------------------------------------------------------
+
+const rollupAvailability = new WeakMap<ClickHouseClient, Promise<boolean>>();
+
+function rollupAvailable(ch: ClickHouseClient): Promise<boolean> {
+  let probe = rollupAvailability.get(ch);
+  if (!probe) {
+    probe = (async () => {
+      try {
+        const r = await ch.query({ query: "EXISTS TABLE events_per_minute", format: "JSONEachRow" });
+        const rows = (await r.json()) as { result: number | string }[];
+        return Number(rows[0]?.result) === 1;
+      } catch {
+        // A failed probe (e.g. ClickHouse briefly unreachable) says nothing
+        // about whether the rollup exists — drop the memo so the next call
+        // re-probes instead of pinning the raw path until restart.
+        rollupAvailability.delete(ch);
+        return false;
+      }
+    })();
+    rollupAvailability.set(ch, probe);
+  }
+  return probe;
+}
+
+// A widget that filters on the service.name resource attribute (instead of
+// the dedicated service field) is still asking a service question — fold a
+// lone equality into `service` so the rollup can answer it. Returns null
+// when the filter isn't foldable.
+function foldServiceAttrFilter(filter: SeriesFilter): SeriesFilter | null {
+  const attrs = filter.resourceAttrs ?? [];
+  if (attrs.length === 0) return filter;
+  if (attrs.length !== 1 || filter.service) return null;
+  const attr = attrs[0];
+  if (!attr || (attr.op && attr.op !== "eq")) return null;
+  const parsed = parseAttributeKey(attr.key);
+  if (parsed.scope !== "resource" || parsed.key !== "service.name") return null;
+  return { ...filter, service: attr.value, resourceAttrs: [] };
+}
+
+function rollupEligible(filter: SeriesFilter, groupBy: string | undefined, step: Step): boolean {
+  if (step.unit === "SECOND") return false; // rollup resolution is one minute
+  if (filter.resourceAttrs?.length) return false;
+  if (filter.search) return false;
+  if (filter.spanName) return false;
+  if (filter.minDurationMs) return false;
+  if (groupBy && groupBy !== "service" && groupBy !== "service.name") return false;
+  return true;
+}
+
+async function countSeriesFromRollup(
+  ch: ClickHouseClient,
+  projectId: string,
+  source: SeriesSource,
+  filter: SeriesFilter,
+  groupBy: string | undefined,
+  step: Step,
+): Promise<{ bucket: string; group: string; count: number }[]> {
+  const { sinceSql, untilSql, sinceExpr, untilExpr } = resolveRange(filter.range);
+  const conds = [
+    "project_id = {projectId:String}",
+    "signal = {signal:String}",
+    // Rollup cells are whole minutes, so a sub-minute `since` cannot be
+    // honored exactly. Round the lower bound down to the cell boundary so the
+    // partial first minute is included in full rather than dropped — edge
+    // buckets may overcount by up to one minute of data, never undercount.
+    // (The upper bound needs no rounding: the cell at until's minute starts
+    // at or before `until` and already satisfies <=.) The fast path only
+    // serves >= 1-minute chart buckets, so the skew stays within one bucket.
+    `minute >= toStartOfMinute(${sinceExpr})`,
+    `minute <= ${untilExpr}`,
+  ];
+  if (filter.service) conds.push("service = {service:String}");
+  if (source === "logs") {
+    // The rollup stores upper(SeverityText); mirror the raw path's
+    // case-insensitive comparison.
+    if (filter.severity) conds.push("severity = upper({severity:String})");
+  } else if (filter.statusCode) {
+    conds.push("status_code = {statusCode:String}");
+  }
+  const groupExpr = groupBy ? "service" : "''";
+
+  const query = `
+    SELECT
+      toString(toStartOfInterval(minute, INTERVAL ${step.n} ${step.unit})) AS bucket,
+      ${groupExpr} AS group_key,
+      sum(c) AS c
+    FROM events_per_minute
+    WHERE ${conds.join(" AND ")}
+    GROUP BY bucket, group_key
+    ORDER BY bucket ASC
+    LIMIT 10000
+  `;
+
+  const r = await ch.query({
+    query,
+    query_params: {
+      projectId,
+      signal: source,
+      since: sinceSql,
+      until: untilSql,
+      service: filter.service ?? "",
+      severity: filter.severity ?? "",
+      statusCode: filter.statusCode ?? "",
+    },
+    format: "JSONEachRow",
+  });
+  const rows = (await r.json()) as { bucket: string; group_key: string; c: string | number }[];
+  return rows.map((row) => ({ bucket: row.bucket, group: row.group_key, count: Number(row.c) }));
+}
+
 export async function countSeries(
   ch: ClickHouseClient,
   projectId: string,
@@ -1130,6 +1259,10 @@ export async function countSeries(
   groupBy: string | undefined,
   step: Step,
 ): Promise<{ bucket: string; group: string; count: number }[]> {
+  const folded = foldServiceAttrFilter(filter);
+  if (folded && rollupEligible(folded, groupBy, step) && (await rollupAvailable(ch))) {
+    return countSeriesFromRollup(ch, projectId, source, folded, groupBy, step);
+  }
   const { sinceSql, untilSql, sinceExpr, untilExpr } = resolveRange(filter.range);
   const split = splitAttrs(filter.resourceAttrs);
   const attr = attrConds(split.resource);
