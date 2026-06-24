@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { schema } from "@superlog/db";
 import type { AgentRunContext, InstalledGithubRepo } from "../agent-run-context.js";
-import type { AgentRunnerBackend } from "../agent-runner-backend.js";
+import type { AgentRunnerBackend, AgentRunnerStartInput } from "../agent-runner-backend.js";
 import { type StartQueuedAgentRunDeps, startQueuedAgentRunWorkflow } from "./start.js";
 
 test("startQueuedAgentRunWorkflow blocks before repo discovery when GitHub is not installed", async () => {
@@ -53,8 +53,52 @@ test("startQueuedAgentRunWorkflow starts runner with capped repo candidates", as
     "runner.start:1",
     "prBaseBranch:development",
     "telemetryHint:session.id",
+    "memories:0",
+    "followUp:none",
     "startRunning:session-1:1",
     "notifyStarted:1",
+  ]);
+});
+
+test("startQueuedAgentRunWorkflow passes agent memories to the runner", async () => {
+  const calls: string[] = [];
+  const ctx = makeContext();
+  ctx.memories = [
+    {
+      id: "mem-1",
+      kind: "terminology",
+      title: "Sessions are called journeys",
+      body: "This org refers to user sessions as journeys in dashboards and alerts.",
+    } as schema.AgentMemory,
+    {
+      id: "mem-2",
+      kind: "infra",
+      title: "Checkout runs on ECS",
+      body: "The checkout service deploys to ECS Fargate behind an ALB.",
+    } as schema.AgentMemory,
+  ];
+
+  let received: Array<{ id: string; kind: string; title: string; body: string }> = [];
+  await startQueuedAgentRunWorkflow(
+    ctx,
+    makeDeps(calls, undefined, (input) => {
+      received = input.memories;
+    }),
+  );
+
+  assert.deepEqual(received, [
+    {
+      id: "mem-1",
+      kind: "terminology",
+      title: "Sessions are called journeys",
+      body: "This org refers to user sessions as journeys in dashboards and alerts.",
+    },
+    {
+      id: "mem-2",
+      kind: "infra",
+      title: "Checkout runs on ECS",
+      body: "The checkout service deploys to ECS Fargate behind an ALB.",
+    },
   ]);
 });
 
@@ -82,6 +126,7 @@ test("startQueuedAgentRunWorkflow fails cleanly when async backend selection rej
 function makeDeps(
   calls: string[],
   overrides: Partial<StartQueuedAgentRunDeps> = {},
+  onStart?: (input: AgentRunnerStartInput) => void,
 ): StartQueuedAgentRunDeps {
   const runner: AgentRunnerBackend = {
     name: "test-runner",
@@ -92,6 +137,9 @@ function makeDeps(
       if (input.telemetryInvestigationHint.includes("session.id")) {
         calls.push("telemetryHint:session.id");
       }
+      calls.push(`memories:${input.memories.length}`);
+      calls.push(`followUp:${input.followUp ? input.followUp.trigger : "none"}`);
+      onStart?.(input);
       return { sessionId: "session-1" };
     },
     async collect() {
@@ -193,6 +241,8 @@ function makeContext(opts: { githubInstalled?: boolean } = {}): AgentRunContext 
     autoMergeFixPrs: "never",
     autoMergeMethod: "squash",
     issueRows: [],
+    memories: [],
+    followUp: null,
   };
 }
 

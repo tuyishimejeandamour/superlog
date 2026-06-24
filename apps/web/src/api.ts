@@ -8,6 +8,16 @@ export type Me = {
   // The onboarding wizard's create-org step posts to /api/me/orgs to fix that.
   org: { id: string; name: string; slug: string; githubSetupNeeded: boolean } | null;
   project: { id: string; name: string; slug: string; hasIngested: boolean } | null;
+  // True when a shared demo project is configured and this project hasn't
+  // ingested yet — the server is serving it read-only sample data. Drives the
+  // demo-explore experience + the persistent install nudge. Flips false the
+  // instant real telemetry lands (hasIngested), teleporting the user to their
+  // own project.
+  demoMode?: boolean;
+  // The user's pinned favorite project + its org. When set, a fresh session
+  // opens these instead of the last-used org/project. Both null when nothing is
+  // pinned. Driven by the ★ in the org/project switcher.
+  favorite?: { orgId: string | null; projectId: string | null };
   // Whether billing hard-blocks are enforced. Metering runs regardless; this
   // gates the "Ingest paused" bar so we don't show it when nothing is blocked.
   billingEnforcement?: boolean;
@@ -405,6 +415,67 @@ export function useRevokeOrgApiKey() {
   });
 }
 
+// User-scoped personal access tokens (superlog_pat_*). An alternative to the
+// browser OAuth flow for authenticating to the MCP server — paste one as a
+// static `Authorization: Bearer` header in your agent's MCP config.
+export type McpExpiryChoice = "never" | "30d" | "90d";
+
+export type McpToken = {
+  id: string;
+  name: string;
+  tokenPrefix: string;
+  projectId: string;
+  projectName: string | null;
+  orgName: string | null;
+  lastUsedAt: string | null;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+};
+
+export type MintedMcpToken = {
+  id: string;
+  name: string;
+  tokenPrefix: string;
+  plaintext: string;
+  projectId: string;
+  expiresAt: string | null;
+  createdAt: string;
+};
+
+export function useMcpTokens() {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["mcp-tokens"],
+    queryFn: () => fetcher<{ tokens: McpToken[] }>("/api/me/mcp-tokens"),
+  });
+}
+
+export function useCreateMcpToken() {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { name: string; projectId?: string; expiry: McpExpiryChoice }) =>
+      fetcher<{ token: MintedMcpToken }>("/api/me/mcp-tokens", {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-tokens"] }),
+  });
+}
+
+export function useRevokeMcpToken() {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (tokenId: string) =>
+      fetcher<{ ok: true }>(`/api/me/mcp-tokens/${tokenId}`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-tokens"] }),
+  });
+}
+
 // Mints an org-scoped GitHub install URL on behalf of the dashboard admin.
 // Same shape the management API produces, but auth-gated on the Better Auth
 // session cookie — admins don't need to mint a management key first.
@@ -723,6 +794,225 @@ export function useDeleteSlackRoute(projectId: string) {
   });
 }
 
+export type CloudConnectionStatus = "pending" | "connected" | "account_mismatch" | "failed";
+
+export type CloudConnection = {
+  id: string;
+  projectId: string;
+  region: string;
+  scrapeRoleArn: string | null;
+  accountId: string | null;
+  status: CloudConnectionStatus;
+  lastVerifiedAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+// The create response also returns the one-time launch URL + external id.
+export type CreatedCloudConnection = CloudConnection & {
+  launchUrl: string;
+  externalId: string;
+};
+
+export function useCloudConnections(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["cloud-connections", projectId],
+    queryFn: () => fetcher<CloudConnection[]>(`/api/projects/${projectId}/cloud-connections`),
+    enabled: !!projectId,
+    // While a connection is pending, poll so zero-paste connects (the stack
+    // reports its role back via the callback) flip to Connected on their own.
+    refetchInterval: (query) => {
+      const rows = query.state.data as CloudConnection[] | undefined;
+      return rows?.some((r) => r.status === "pending") ? 4000 : false;
+    },
+  });
+}
+
+export function useCreateCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { region: string }) =>
+      fetcher<CreatedCloudConnection>(`/api/projects/${projectId}/cloud-connections`, {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-connections", projectId] }),
+  });
+}
+
+export function useVerifyCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string; scrapeRoleArn: string }) =>
+      fetcher<CloudConnection>(`/api/projects/${projectId}/cloud-connections/${input.id}/verify`, {
+        method: "POST",
+        body: JSON.stringify({ scrapeRoleArn: input.scrapeRoleArn }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-connections", projectId] }),
+  });
+}
+
+export type StackComponentState = "missing" | "pending" | "working" | "broken";
+export type StackComponentKey = "connection" | "metrics" | "logs";
+export type StackComponent = {
+  key: StackComponentKey;
+  label: string;
+  state: StackComponentState;
+  detail: string;
+  lastReceivedAt: string | null;
+};
+export type CloudStackHealth = { components: StackComponent[] };
+
+// Reconciliation health for a connection's stack (connection / metrics / logs).
+// Polls so the live "last received" + working/quiet signals stay fresh.
+export function useCloudStackHealth(
+  projectId: string | undefined,
+  connectionId: string | undefined,
+  enabled: boolean,
+) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["cloud-stack-health", projectId, connectionId],
+    queryFn: () =>
+      fetcher<CloudStackHealth>(
+        `/api/projects/${projectId}/cloud-connections/${connectionId}/stack-health`,
+      ),
+    enabled: !!projectId && !!connectionId && enabled,
+    refetchInterval: 15000,
+  });
+}
+
+// Set up (or idempotently re-launch) metric or log streaming: returns the
+// CloudFormation launch URL for the corresponding stack, reusing the stream's
+// persisted ingest key on repeat calls.
+export function useSetupCloudStream(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { connectionId: string; kind: "metrics" | "logs" }) =>
+      fetcher<{ launchUrl: string; keyPrefix: string }>(
+        `/api/projects/${projectId}/cloud-connections/${input.connectionId}/${input.kind}-stream`,
+        { method: "POST" },
+      ),
+    onSuccess: (_data, vars) =>
+      qc.invalidateQueries({ queryKey: ["cloud-stack-health", projectId, vars.connectionId] }),
+  });
+}
+
+export type CloudResourceRow = {
+  id: string;
+  connectionId: string;
+  arn: string;
+  service: string;
+  resourceType: string | null;
+  region: string | null;
+  accountId: string | null;
+  name: string | null;
+  tags: Record<string, string> | null;
+  lastSeenAt: string;
+};
+
+export function useCloudResources(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["cloud-resources", projectId],
+    queryFn: () => fetcher<CloudResourceRow[]>(`/api/projects/${projectId}/cloud-resources`),
+    enabled: !!projectId,
+  });
+}
+
+// Trigger an inventory sweep for one connection; resources list invalidates after.
+export function useSyncCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (connectionId: string) =>
+      fetcher<{ discovered: number; removed: number }>(
+        `/api/projects/${projectId}/cloud-connections/${connectionId}/sync`,
+        { method: "POST" },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-resources", projectId] }),
+  });
+}
+
+export function useDeleteCloudConnection(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetcher<{ ok: true }>(`/api/projects/${projectId}/cloud-connections/${id}`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["cloud-connections", projectId] }),
+  });
+}
+
+// Per-project ingest source filters: turn a telemetry source (SDK/OTLP or AWS
+// CloudWatch) on/off per signal. The proxy ack-drops disabled telemetry.
+export type IngestFilterState = {
+  otlp: { traces: boolean; logs: boolean; metrics: boolean };
+  aws: { logs: boolean; metrics: boolean };
+};
+
+export function useIngestFilters(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["ingest-filters", projectId],
+    enabled: !!projectId,
+    queryFn: () => fetcher<IngestFilterState>(`/api/projects/${projectId}/ingest-filters`),
+  });
+}
+
+export function useSetIngestFilters(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (state: IngestFilterState) =>
+      fetcher<IngestFilterState>(`/api/projects/${projectId}/ingest-filters`, {
+        method: "PUT",
+        body: JSON.stringify(state),
+      }),
+    onSuccess: (data) => qc.setQueryData(["ingest-filters", projectId], data),
+  });
+}
+
+// --- Service map / topology -------------------------------------------------
+
+export type TopologyDoc = {
+  status: "empty" | "idle" | "generating" | "error";
+  graph: import("@superlog/topology").Topology | null;
+  enrichment: import("@superlog/topology").TopologyEnrichment | null;
+  generatedAt: string | null;
+  error?: string | null;
+};
+
+export function useTopology(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["topology", projectId],
+    enabled: !!projectId,
+    queryFn: () => fetcher<TopologyDoc>(`/api/projects/${projectId}/topology`),
+    // While a build is in flight, poll so the map appears when it lands.
+    refetchInterval: (q) => (q.state.data?.status === "generating" ? 4000 : false),
+  });
+}
+
+export function useGenerateTopology(projectId: string) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      fetcher<{ status: string }>(`/api/projects/${projectId}/topology/generate`, {
+        method: "POST",
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["topology", projectId] }),
+  });
+}
+
 export type LinearInstallation =
   | { installed: false }
   | {
@@ -828,6 +1118,21 @@ export function useSetActiveProject() {
         method: "PUT",
         body: JSON.stringify({ projectId }),
       }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["me"] }),
+  });
+}
+
+// Pin a project as the favorite (opens by default on a fresh session), or pass
+// null to clear the favorite. The server pins the active org alongside it.
+export function useSetFavoriteProject() {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (projectId: string | null) =>
+      fetcher<{ favorite: { orgId: string | null; projectId: string | null } }>(
+        "/api/me/favorite",
+        { method: "PUT", body: JSON.stringify({ projectId }) },
+      ),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["me"] }),
   });
 }
@@ -969,6 +1274,91 @@ export function useSaveOrgAgentSettings() {
         body: JSON.stringify(patch),
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["org-agent-settings"] }),
+  });
+}
+
+export type AgentMemoryKind = "feedback" | "terminology" | "infra" | "project";
+
+export type AgentMemory = {
+  id: string;
+  kind: AgentMemoryKind;
+  projectId: string;
+  title: string;
+  body: string;
+  status: "active" | "archived";
+  source: "agent" | "user" | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export function useProjectAgentMemories(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  return useQuery({
+    queryKey: ["project-agent-memories", projectId],
+    queryFn: () =>
+      fetcher<{ memories: AgentMemory[] }>(`/api/org/projects/${projectId}/agent-memories`),
+    enabled: !!projectId,
+  });
+}
+
+function requireProjectId(projectId: string | undefined): string {
+  if (!projectId) throw new Error("No project selected");
+  return projectId;
+}
+
+export function useCreateProjectAgentMemory(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { kind: AgentMemoryKind; title: string; body: string }) =>
+      fetcher<{ memory: AgentMemory }>(
+        `/api/org/projects/${requireProjectId(projectId)}/agent-memories`,
+        {
+          method: "POST",
+          body: JSON.stringify(input),
+        },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["project-agent-memories", projectId] }),
+  });
+}
+
+export function useUpdateProjectAgentMemory(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      ...patch
+    }: {
+      id: string;
+      kind?: AgentMemoryKind;
+      title?: string;
+      body?: string;
+      status?: "active" | "archived";
+    }) =>
+      fetcher<{ memory: AgentMemory }>(
+        `/api/org/projects/${requireProjectId(projectId)}/agent-memories/${id}`,
+        {
+          method: "PUT",
+          body: JSON.stringify(patch),
+        },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["project-agent-memories", projectId] }),
+  });
+}
+
+export function useDeleteProjectAgentMemory(projectId: string | undefined) {
+  const fetcher = useFetcher();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetcher<{ ok: boolean }>(
+        `/api/org/projects/${requireProjectId(projectId)}/agent-memories/${id}`,
+        {
+          method: "DELETE",
+        },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["project-agent-memories", projectId] }),
   });
 }
 

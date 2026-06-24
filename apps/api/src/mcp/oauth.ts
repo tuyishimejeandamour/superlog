@@ -17,8 +17,12 @@ import type { McpConfig } from "./config.js";
 
 const log = logger.child({ scope: "mcp-oauth" });
 
-const ACCESS_TTL_SECONDS = 60 * 60;
-const REFRESH_TTL_SECONDS = 60 * 60 * 24 * 30;
+// Access tokens last ~1 month so even MCP clients that never exercise the
+// refresh-token grant (they just keep replaying the access token) stay
+// connected for a full month before re-auth. Clients that do refresh get a
+// longer-lived refresh token, so they re-auth even less often.
+export const ACCESS_TTL_SECONDS = 60 * 60 * 24 * 30;
+export const REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90;
 const CODE_TTL_SECONDS = 60 * 5;
 
 type AuthorizeParams = {
@@ -446,17 +450,34 @@ function timingSafeEq(a: string, b: string): boolean {
   return out === 0;
 }
 
-function isValidRedirectUri(uri: string): boolean {
+// Browser-executable or local-resource schemes that must never be redirect
+// targets, even though they parse as URLs.
+const FORBIDDEN_REDIRECT_SCHEMES = new Set([
+  "javascript:",
+  "data:",
+  "file:",
+  "blob:",
+  "about:",
+  "vbscript:",
+]);
+
+export function isValidRedirectUri(uri: string): boolean {
+  let u: URL;
   try {
-    const u = new URL(uri);
-    if (u.protocol === "https:") return true;
-    if (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1")) {
-      return true;
-    }
-    return false;
+    u = new URL(uri);
   } catch {
     return false;
   }
+  if (u.protocol === "https:") return true;
+  if (u.protocol === "http:") {
+    return u.hostname === "localhost" || u.hostname === "127.0.0.1";
+  }
+  // RFC 8252 §7.1: native apps (Cursor, VS Code, Claude Desktop, …) register
+  // private-use URI schemes as their OAuth callbacks — e.g.
+  // cursor://anysphere.cursor-mcp/oauth/callback. These are public clients;
+  // PKCE S256 (enforced at authorize) plus exact redirect-URI matching against
+  // the registered client are the safeguards, not the scheme.
+  return !FORBIDDEN_REDIRECT_SCHEMES.has(u.protocol);
 }
 
 function buildErrorRedirect(params: AuthorizeParams, code: string, description: string): string {
