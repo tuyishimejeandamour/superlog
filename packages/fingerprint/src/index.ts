@@ -83,6 +83,7 @@ export function messageBucketFor(message: string | null | undefined): string {
   if (!message) return "";
   let s = unwrapAnthropicErrorMessage(message);
   s = s.replace(/https?:\/\/\S+/gi, "<url>");
+  s = collapseRequestPaths(s);
   s = s.replace(/\b[\w.+-]+@[\w.-]+\.\w+\b/g, "<email>");
   s = s.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<uuid>");
   s = s.replace(/\b\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?(?:[+-]\d{2}:?\d{2})?\b/g, "<ts>");
@@ -92,6 +93,19 @@ export function messageBucketFor(message: string | null | undefined): string {
   s = s.replace(/\b\d+\b/g, "<n>");
   s = s.replace(/\s+/g, " ").trim().toLowerCase();
   return s.length > MESSAGE_BUCKET_MAX ? s.slice(0, MESSAGE_BUCKET_MAX) : s;
+}
+
+// Collapse leading-slash request paths to a single `<path>` token. A route
+// scanner hammering a server emits one error per probed URL (`/wp-admin`,
+// `/.env`, `/.git/config`, …) that are otherwise identical — same type, same
+// stacktrace. Without this every probed path becomes its own fingerprint, so a
+// single bot sweep explodes into tens of thousands of distinct issues and
+// floods ingestion. We only collapse a slash at a token boundary (start or
+// after whitespace) so in-word slashes like `and/or` or `client/server` stay
+// intact. The HTTP method (`GET`/`POST`) is left alone, so a sweep groups into
+// at most a handful of issues (one per method) instead of thousands.
+function collapseRequestPaths(s: string): string {
+  return s.replace(/(^|\s)\/\S*/g, "$1<path>");
 }
 
 function unwrapAnthropicErrorMessage(raw: string): string {
@@ -104,6 +118,7 @@ function unwrapAnthropicErrorMessage(raw: string): string {
 export function normalizeMessage(body: string): string {
   let s = body;
   s = s.replace(/https?:\/\/\S+/gi, "<url>");
+  s = collapseRequestPaths(s);
   s = s.replace(/\b[\w.+-]+@[\w.-]+\.\w+\b/g, "<email>");
   s = s.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<uuid>");
   s = s.replace(/\b\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?(?:[+-]\d{2}:?\d{2})?\b/g, "<ts>");

@@ -3,7 +3,26 @@ import { test } from "node:test";
 import {
   buildResolvedIncidentSlackRoot,
   runResolvedIncidentSideEffects,
+  shouldRunResolvedIncidentSideEffects,
 } from "./resolution-side-effects.js";
+
+test("shouldRunResolvedIncidentSideEffects runs cleanup for stale already-closed resolve requests", () => {
+  assert.equal(
+    shouldRunResolvedIncidentSideEffects({ requestedStatus: "resolved", incidentExists: true }),
+    true,
+  );
+});
+
+test("shouldRunResolvedIncidentSideEffects skips reopen requests and missing incidents", () => {
+  assert.equal(
+    shouldRunResolvedIncidentSideEffects({ requestedStatus: "open", incidentExists: true }),
+    false,
+  );
+  assert.equal(
+    shouldRunResolvedIncidentSideEffects({ requestedStatus: "resolved", incidentExists: false }),
+    false,
+  );
+});
 
 test("runResolvedIncidentSideEffects closes incident PRs through the shared helper and refreshes Slack root", async () => {
   const calls: string[] = [];

@@ -3,6 +3,8 @@ import {
   confirmResolutionProposal,
   db,
   dismissResolutionProposal,
+  recordInboundInteraction,
+  requestFollowUpAgentRun,
   resolveIncident,
   schema,
   syncLoopsContactsForOrg,
@@ -12,6 +14,7 @@ import type { Hono } from "hono";
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { recordFeedback } from "./feedback.js";
+import { resolveFeedbackIncidentId } from "./follow-up-offer.js";
 import { getDeviceFlow, getSkillDeviceForIntegration } from "./gateway.js";
 import { closeAgentPullRequestOnGithub } from "./github.js";
 import { runResolvedIncidentSideEffectsForIncident } from "./incidents/resolution-side-effects.js";
@@ -174,15 +177,16 @@ export function mountSlackPublic(app: Hono<any>): void {
     }
     if (payload.type !== "event_callback") return c.json({ ok: true });
 
-    try {
-      await handleSlackEventEnvelope(payload);
-    } catch (err) {
+    // Ack Slack immediately and process out of band: the handler does DB work
+    // and an outbound chat.postMessage, which can exceed Slack's ~3s window and
+    // trigger retries (= duplicate delivery). The handler is idempotent on the
+    // event id, so the rare retry that still arrives is deduped.
+    void handleSlackEventEnvelope(payload).catch((err) =>
       log.error(
         { err, event_type: payload.event?.type, event_id: payload.event_id },
         "slack event handler failed",
-      );
-      throw err;
-    }
+      ),
+    );
     return c.json({ ok: true });
   });
 
@@ -235,6 +239,12 @@ async function handleSlackBlockActions(payload: SlackInteractivityPayload): Prom
   if (actionId.startsWith("resolve_incident:")) {
     const incidentId = actionId.slice("resolve_incident:".length);
     if (incidentId) await handleSlackResolveIncident(incidentId, payload);
+    return;
+  }
+
+  if (actionId.startsWith("follow_up_confirm:")) {
+    const feedbackId = actionId.slice("follow_up_confirm:".length);
+    if (feedbackId) await handleFollowUpConfirm(feedbackId, payload);
     return;
   }
 
@@ -365,12 +375,12 @@ async function handleSlackResolveIncident(
     // resolves. Skip the investigation event to avoid coupling to a possibly-
     // unrelated latest investigation.
   });
+  await runSlackResolvedIncidentSideEffects(incidentId);
+
   if (!resolved) {
     log.info({ incidentId }, "resolve_incident click lost race with concurrent close");
     return;
   }
-
-  await runSlackResolvedIncidentSideEffects(incidentId);
 
   const installation = await installationForIncident({
     pinnedId: incident.slackInstallationId,
@@ -396,8 +406,10 @@ async function runSlackResolvedIncidentSideEffects(incidentId: string): Promise<
     closePullRequest: (pr) =>
       closeAgentPullRequestOnGithub({
         installationId: pr.githubInstallationId,
+        fallbackInstallationIds: pr.fallbackGithubInstallationIds,
         repoFullName: pr.repoFullName,
         prNumber: pr.prNumber,
+        prNodeId: pr.prNodeId,
       }),
   });
 }
@@ -436,8 +448,10 @@ async function handleProposalDecision(
       closePullRequest: (pr) =>
         closeAgentPullRequestOnGithub({
           installationId: pr.githubInstallationId,
+          fallbackInstallationIds: pr.fallbackGithubInstallationIds,
           repoFullName: pr.repoFullName,
           prNumber: pr.prNumber,
+          prNodeId: pr.prNodeId,
         }),
     });
   }
@@ -498,6 +512,68 @@ async function handleProposalDecision(
   } catch (err) {
     log.warn({ err, proposalId }, "proposal message re-render failed");
   }
+}
+
+// Handle a `follow_up_confirm:<feedbackId>` click from the offer posted by
+// offerFollowUpForFeedback. Enqueues a confirm-gated follow-up run (the
+// confirmed flag bypasses the project's auto-follow-up gate, not the caps)
+// and replies in-thread with the outcome.
+async function handleFollowUpConfirm(
+  feedbackId: string,
+  payload: SlackInteractivityPayload,
+): Promise<void> {
+  const feedback = await db.query.feedback
+    .findFirst({ where: eq(schema.feedback.id, feedbackId) })
+    .catch(() => null);
+  if (!feedback) {
+    log.warn({ feedbackId }, "follow_up_confirm click for unknown feedback");
+    return;
+  }
+  const incidentId = await resolveFeedbackIncidentId(feedback);
+  if (!incidentId) {
+    log.warn({ feedbackId }, "follow_up_confirm feedback does not bind to an incident");
+    return;
+  }
+  const incident = await db.query.incidents.findFirst({
+    where: eq(schema.incidents.id, incidentId),
+  });
+  if (!incident) return;
+
+  const result = await requestFollowUpAgentRun(db, {
+    incidentId,
+    trigger: "feedback",
+    confirmed: true,
+    interaction: {
+      channel: "feedback",
+      author:
+        feedback.authorExternal?.githubLogin ??
+        feedback.authorExternal?.slackUserId ??
+        feedback.authorUserId,
+      text: feedback.body,
+      occurredAt: (feedback.createdAt ?? new Date()).toISOString(),
+    },
+  });
+
+  const installation = await installationForIncident({
+    pinnedId: incident.slackInstallationId,
+    teamId: payload.team?.id ?? "",
+  });
+  if (!installation || !incident.slackChannelId || !incident.slackThreadTs) return;
+  const clickedBy = payload.user?.id ? `<@${payload.user.id}>` : "someone";
+  const text =
+    result.outcome === "skipped"
+      ? result.reason === "follow_up_cap_reached"
+        ? ":no_entry: Can't run another follow-up — this incident reached its follow-up limit."
+        : result.reason === "run_active"
+          ? ":hourglass: An investigation is already running for this incident; the feedback was recorded."
+          : `:no_entry: Follow-up not started (${result.reason.replace(/_/g, " ")}).`
+      : `:mag: Follow-up investigation queued by ${clickedBy} — the agent will take this feedback into account.`;
+  await postSlackThreadReply({
+    botToken: installation.botAccessToken,
+    channel: incident.slackChannelId,
+    threadTs: incident.slackThreadTs,
+    text,
+  });
 }
 
 async function postSlackThreadReply(opts: {
@@ -825,32 +901,53 @@ async function handleSlackEventEnvelope(payload: SlackEventEnvelope): Promise<vo
   });
   if (!incident) return;
 
-  const agentRun = await db.query.agentRuns.findFirst({
-    where: eq(schema.agentRuns.incidentId, incident.id),
-    orderBy: [desc(schema.agentRuns.createdAt)],
+  // Talking to the investigation: continue the SAME durable session where we
+  // can (resume / steer), and only spin a fresh run when no session survives.
+  // The shared path records the message, reactivates a terminal run, or
+  // cold-starts — all channels go through it.
+  const result = await recordInboundInteraction(db, {
+    incidentId: incident.id,
+    interaction: {
+      channel: "slack_reply",
+      author: event.user ?? null,
+      text: event.text.trim(),
+      occurredAt: new Date().toISOString(),
+    },
+    dedupeKey: payload.event_id
+      ? `slack:${payload.event_id}`
+      : `slack:${event.channel}:${event.ts}`,
+    detail: {
+      slackEventId: payload.event_id ?? null,
+      slackUserId: event.user ?? null,
+      slackChannelId: event.channel,
+      slackThreadTs: event.thread_ts,
+      slackMessageTs: event.ts,
+    },
   });
-  if (!agentRun || agentRun.state !== "awaiting_human") return;
 
-  await db
-    .insert(schema.incidentEvents)
-    .values({
-      agentRunId: agentRun.id,
-      kind: "human_reply",
-      summary: event.text.trim(),
-      detail: {
-        slackEventId: payload.event_id ?? null,
-        slackUserId: event.user ?? null,
-        slackChannelId: event.channel,
-        slackThreadTs: event.thread_ts,
-        slackMessageTs: event.ts,
-      },
-      dedupeKey: payload.event_id
-        ? `slack:${payload.event_id}`
-        : `slack:${event.channel}:${event.ts}`,
-    })
-    .onConflictDoNothing({
-      target: [schema.incidentEvents.agentRunId, schema.incidentEvents.dedupeKey],
+  if (result.outcome === "duplicate") return;
+  if (result.outcome === "skipped") {
+    logger.info(
+      { scope: "slack", incident_id: incident.id, reason: result.reason },
+      "slack reply did not continue the investigation",
+    );
+    return;
+  }
+
+  // One instant acknowledgement in the originating thread so the human knows
+  // the message landed, rather than silence until the agent replies.
+  const installation = await installationForIncident({
+    pinnedId: incident.slackInstallationId,
+    teamId: payload.team_id ?? "",
+  });
+  if (installation) {
+    await postSlackThreadReply({
+      botToken: installation.botAccessToken,
+      channel: event.channel,
+      threadTs: event.thread_ts,
+      text: ":mag: On it — I'll follow up in this thread.",
     });
+  }
 }
 
 async function resolveUserOrg(
@@ -1053,6 +1150,7 @@ type SlackEventEnvelope = {
   type?: string;
   challenge?: string;
   event_id?: string;
+  team_id?: string;
   event?: {
     type?: string;
     subtype?: string;
